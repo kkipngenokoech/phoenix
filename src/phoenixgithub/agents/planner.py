@@ -7,8 +7,18 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import subprocess
 from pathlib import Path
 from typing import Any
+
+_STOP_WORDS = {
+    "about", "after", "before", "being", "below", "could", "fixed",
+    "given", "issue", "other", "right", "should", "since", "their",
+    "there", "these", "those", "using", "value", "where", "which",
+    "while", "would", "error", "false", "true", "null", "none",
+    "return", "import", "class", "function", "method", "object",
+}
 
 from phoenixgithub.agents.base import BaseAgent
 
@@ -39,6 +49,13 @@ You MUST respond with valid JSON matching this schema:
 }
 
 Rules:
+- CRITICAL: Every path in "files_to_modify" MUST already exist in the repository
+  file tree shown in the prompt. Do NOT invent generic paths like src/core/config.py,
+  src/core/utils.py, src/core/models.py, or any path not visible in the tree.
+  If you cannot identify the correct existing file, set "files_to_modify": [] and
+  describe the uncertainty in "approach" — do not guess.
+- "files_to_create" is only for genuinely new files (e.g. a new test file alongside
+  an existing one). Never create a substitute for a file that already exists.
 - Be specific about file paths (relative to repo root).
 - Keep steps ordered by dependency — things that must happen first go first.
 - Consider edge cases and backwards compatibility.
@@ -178,7 +195,6 @@ Rules:
             if pyproject.exists():
                 try:
                     text = pyproject.read_text()
-                    import re
                     m = re.search(r'name\s*=\s*["\']([^"\']+)["\']', text)
                     if m:
                         pkg_name = m.group(1)
@@ -273,6 +289,44 @@ Rules:
         walk(root_path, 0)
         return "\n".join(lines[:200])
 
+    def _grep_for_keywords(self, root: str, keywords: list[str]) -> dict[str, int]:
+        """Return {relative_path: keyword_hit_count} by grepping the repo.
+
+        Used as a content-based fallback when path-name scoring finds no
+        confident candidates.  Files that contain more issue keywords rank higher.
+        """
+        root_path = Path(root)
+        code_exts = {".py", ".js", ".ts", ".tsx", ".jsx"}
+        skip_dirs = {"node_modules", ".venv", "venv", ".git", "__pycache__"}
+        hits: dict[str, int] = {}
+
+        for keyword in keywords[:8]:
+            try:
+                result = subprocess.run(
+                    [
+                        "grep", "-rl",
+                        "--include=*.py", "--include=*.js",
+                        "--include=*.ts", "--include=*.tsx", "--include=*.jsx",
+                        "-i", keyword, str(root_path),
+                    ],
+                    capture_output=True, text=True, timeout=8,
+                )
+                for line in result.stdout.splitlines():
+                    p = Path(line.strip())
+                    if not p.is_file() or p.suffix not in code_exts:
+                        continue
+                    if any(sd in p.parts for sd in skip_dirs):
+                        continue
+                    try:
+                        rel = str(p.relative_to(root_path))
+                        hits[rel] = hits.get(rel, 0) + 1
+                    except ValueError:
+                        pass
+            except Exception:
+                continue
+
+        return hits
+
     def _read_relevant_files(
         self,
         root: str,
@@ -280,52 +334,46 @@ Rules:
         max_chars_per_file: int = 1200,
         issue_hint: str = "",
     ) -> str:
-        """Read Python/JS/TS source files from the main package only.
+        """Read Python/JS/TS source files most relevant to the issue hint.
 
-        Skips docs/, examples/, tests/, scripts/ directories and entry-point
-        files (cli.py, __main__.py, setup.py) that rarely contain the logic
-        relevant to bug fixes and tend to have docstrings/comments that trigger
-        WAF rules on the CMU AI gateway.
+        Two-stage ranking:
+        1. Path-name scoring: file stem/name matches issue keywords → fast.
+        2. Content-grep fallback: when path scores are all weak (≤ depth bonus
+           only), grep the repo for issue keywords and re-rank by content hits.
+           This handles issues where the relevant file has a generic name
+           (e.g. ``runtime-core.ts`` for a Vue SSR bug).
 
-        Files are ranked by relevance to the issue hint (title + description)
-        before alphabetical fallback, so the most useful context comes first.
+        Java files are skipped entirely — the CMU AI gateway WAF rejects their
+        annotation-heavy syntax.  The planner uses the file tree + issue text
+        for Java repos instead.
         """
         root_path = Path(root)
-        # Java files trigger the CMU AI gateway WAF even at small sizes due to
-        # verbose annotations and import statements. Skip them entirely and let
-        # the planner rely on the file tree + issue text instead.
         code_exts = {".py", ".js", ".ts", ".tsx", ".jsx"}
         skip_dirs = {
             ".git", "__pycache__", "node_modules", ".venv", "venv",
             "docs", "doc", "examples", "example", "tests", "test",
             "scripts", "script", "fixtures", "spec", "bench", "benchmarks",
         }
-        # Entry-point / boilerplate files — skip to avoid WAF-triggering content
         skip_stems = {"cli", "setup", "conftest", "__main__", "manage", "wsgi", "asgi"}
 
         hint_lower = issue_hint.lower()
+        hint_words = [
+            w for w in re.findall(r"[a-zA-Z][a-zA-Z0-9_]{3,}", hint_lower)
+            if w not in _STOP_WORDS
+        ]
 
-        def _score(f: Path) -> int:
-            """Higher score = more relevant (picked first)."""
+        def _path_score(f: Path) -> int:
+            """Score based on file path/stem matching issue keywords."""
             stem = f.stem.lower()
-            name = f.name.lower()
             score = 0
-            if hint_lower:
-                if stem in hint_lower or name in hint_lower:
+            if hint_words:
+                if stem in hint_lower:
                     score += 10
-                # Check if any word in the hint appears in the stem
-                for word in hint_lower.split():
-                    if len(word) > 3 and word in stem:
+                for word in hint_words:
+                    if word in stem:
                         score += 3
-            # Prefer files deeper in the tree (more likely to be domain logic)
             score += min(len(f.parts), 5)
             return score
-
-        # For large repos (>500 source files) reduce per-file limit further
-        source_file_count = sum(1 for _ in root_path.rglob("*") if _.suffix in code_exts)
-        if source_file_count > 500:
-            max_files = min(max_files, 3)
-            max_chars_per_file = min(max_chars_per_file, 800)
 
         candidates = [
             f for f in root_path.rglob("*")
@@ -336,8 +384,37 @@ Rules:
             and not f.stem.startswith("test_")
             and not f.stem.endswith("_test")
         ]
-        # Sort: highest relevance score first, then alphabetical as tiebreaker
-        candidates.sort(key=lambda f: (-_score(f), str(f)))
+
+        # For large repos reduce excerpt size to stay within gateway limits.
+        if len(candidates) > 500:
+            max_files = min(max_files, 3)
+            max_chars_per_file = min(max_chars_per_file, 800)
+
+        candidates.sort(key=lambda f: (-_path_score(f), str(f)))
+
+        # --- Content-grep fallback ---
+        # If the best path score is ≤ 5 (only depth bonus, no keyword match),
+        # run a grep-based search and re-rank candidates by content hits.
+        used_grep = False
+        top_path_score = _path_score(candidates[0]) if candidates else 0
+        if top_path_score <= 5 and hint_words:
+            grep_hits = self._grep_for_keywords(root, hint_words)
+            if grep_hits:
+                used_grep = True
+                def _combined_score(f: Path) -> int:
+                    rel = str(f.relative_to(root_path))
+                    return _path_score(f) + grep_hits.get(rel, 0) * 5
+                candidates.sort(key=lambda f: (-_combined_score(f), str(f)))
+                logger.info(
+                    "Planner: low path-score (%d); grep fallback found %d matching files",
+                    top_path_score, len(grep_hits),
+                )
+
+        header_note = (
+            "Found via content search (grep) — these files contain issue keywords."
+            if used_grep
+            else "Modify these files; do not recreate them from scratch."
+        )
 
         chunks: list[str] = []
         for f in candidates:
@@ -352,4 +429,6 @@ Rules:
             except Exception:
                 continue
 
-        return "\n\n".join(chunks) if chunks else "(no source files found)"
+        if not chunks:
+            return "(no source files found)"
+        return f"<!-- {header_note} -->\n\n" + "\n\n".join(chunks)
