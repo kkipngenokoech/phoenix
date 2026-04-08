@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import threading
 from typing import Any, Callable
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 from phoenixgithub.config import Config
 from phoenixgithub.github_app import GitHubAppAuth
@@ -17,6 +20,27 @@ from phoenixgithub.models import Run
 from phoenixgithub.state import StateManager
 
 logger = logging.getLogger(__name__)
+
+# ── Eval event broadcast ──────────────────────────────────────────────────────
+# When Phoenix transitions an issue to a terminal label (ai:review, ai:done,
+# ai:failed), the label webhook fires back to this server.  We broadcast those
+# events over SSE so the eval runner can react instantly instead of polling.
+
+_eval_subscribers: list[asyncio.Queue] = []
+_eval_subscribers_lock = threading.Lock()
+
+TERMINAL_LABELS = {"ai:review", "ai:done", "ai:failed"}
+
+
+def _broadcast_eval_event(event: dict) -> None:
+    """Put an eval event on every active SSE subscriber queue (thread-safe)."""
+    with _eval_subscribers_lock:
+        subscribers = list(_eval_subscribers)
+    for q in subscribers:
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            pass
 
 
 def verify_signature(payload: bytes, signature: str, secret: str) -> bool:
@@ -35,20 +59,51 @@ def create_webhook_app(
     state: StateManager,
     on_dispatch: Callable[[Run, GitHubClient], None],
 ) -> FastAPI:
-    """Create a FastAPI application that handles GitHub webhook events.
-
-    Args:
-        config: Application configuration.
-        app_auth: GitHub App auth manager for obtaining installation tokens.
-        state: State manager for dispatch tracking.
-        on_dispatch: Callback invoked with (run, github_client) when a run is dispatched.
-    """
+    """Create a FastAPI application that handles GitHub webhook events."""
     app = FastAPI(title="PhoenixGitHub Webhook", docs_url=None, redoc_url=None)
     webhook_secret = config.github_app.webhook_secret
 
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/eval/stream")
+    async def eval_stream() -> StreamingResponse:
+        """SSE stream of terminal label events for the eval runner.
+
+        Each event is a JSON object:
+            {"repo": "owner/name", "issue_number": 42, "label": "ai:review"}
+
+        The eval runner subscribes here instead of polling the GitHub API.
+        """
+        q: asyncio.Queue = asyncio.Queue(maxsize=256)
+        with _eval_subscribers_lock:
+            _eval_subscribers.append(q)
+
+        async def generate():
+            try:
+                # Heartbeat every 15 s to keep the connection alive
+                while True:
+                    try:
+                        event = await asyncio.wait_for(q.get(), timeout=15.0)
+                        yield f"data: {json.dumps(event)}\n\n"
+                    except asyncio.TimeoutError:
+                        yield ": heartbeat\n\n"
+            finally:
+                with _eval_subscribers_lock:
+                    try:
+                        _eval_subscribers.remove(q)
+                    except ValueError:
+                        pass
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.post("/webhook")
     async def handle_webhook(
@@ -76,15 +131,27 @@ def create_webhook_app(
             return {"status": "ignored", "reason": f"action={action}"}
 
         label_name = payload.get("label", {}).get("name", "")
+        issue_number = payload.get("issue", {}).get("number")
+        repo_full_name = payload.get("repository", {}).get("full_name", "")
+
+        # Broadcast terminal label transitions to eval SSE subscribers
+        if label_name in TERMINAL_LABELS:
+            _broadcast_eval_event({
+                "repo": repo_full_name,
+                "issue_number": issue_number,
+                "label": label_name,
+            })
+            logger.info(
+                f"Eval event broadcast: {repo_full_name}#{issue_number} → {label_name}"
+            )
+
         trigger_labels = {config.labels.ready, config.labels.revise}
         if label_name not in trigger_labels:
             return {"status": "ignored", "reason": f"label={label_name}"}
 
         # Extract event context
         issue = payload["issue"]
-        issue_number = issue["number"]
         repo_data = payload["repository"]
-        repo_full_name = repo_data["full_name"]  # "owner/repo"
         installation_id = payload.get("installation", {}).get("id")
 
         if not installation_id:

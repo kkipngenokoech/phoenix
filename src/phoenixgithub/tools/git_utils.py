@@ -6,9 +6,21 @@ from git import Repo
 
 
 def get_default_branch(repo: Repo) -> str:
-    """Return best default branch guess for a local repo clone."""
+    """Return the default branch for a local repo clone.
+
+    Priority:
+    1. Symbolic ref of the remote HEAD (most accurate — what GitHub reports)
+    2. Common default names present in the local branch list
+    3. First local branch as final fallback
+    """
+    try:
+        # e.g. "ref: refs/remotes/origin/main" → "main"
+        ref = repo.git.symbolic_ref("refs/remotes/origin/HEAD")
+        return ref.split("/")[-1]
+    except Exception:
+        pass
     branches = [b.name for b in repo.branches]
-    for candidate in ("main", "master"):
+    for candidate in ("main", "master", "dev", "develop", "trunk"):
         if candidate in branches:
             return candidate
     return branches[0] if branches else "main"

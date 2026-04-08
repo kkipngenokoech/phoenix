@@ -1,0 +1,46 @@
+[
+  {
+    "repo": "apache/lucene",
+    "fork": "kkipngenokoech/lucene",
+    "issue_number": 1,
+    "issue_url": "https://github.com/kkipngenokoech/lucene/issues/1",
+    "task_type": "real_issue",
+    "title": "Backport Bot",
+    "label_applied": null,
+    "upstream_issue_number": 14496,
+    "upstream_issue_url": "https://github.com/apache/lucene/issues/14496"
+  },
+  {
+    "repo": "apache/lucene",
+    "fork": "kkipngenokoech/lucene",
+    "issue_number": 2,
+    "issue_url": "https://github.com/kkipngenokoech/lucene/issues/2",
+    "task_type": "real_issue",
+    "title": "ReaderUtil.partitionByLeaf API design: ordinal tracking for scatter/gather pattern",
+    "label_applied": null,
+    "upstream_issue_number": 15905,
+    "upstream_issue_url": "https://github.com/apache/lucene/issues/15905"
+  },
+  {
+    "repo": "apache/lucene",
+    "fork": "kkipngenokoech/lucene",
+    "issue_number": 3,
+    "issue_url": "https://github.com/kkipngenokoech/lucene/issues/3",
+    "task_type": "real_issue",
+    "title": "Coordinate DocValues skip list evaluation across multiple fields in conjunction queries",
+    "label_applied": null,
+    "upstream_issue_number": 15770,
+    "upstream_issue_url": "https://github.com/apache/lucene/issues/15770"
+  },
+  {
+    "repo": "langchain-ai/langchain",
+    "fork": "kkipngenokoech/langchain",
+    "issue_number": 24,
+    "issue_url": "https://github.com/kkipngenokoech/langchain/issues/24",
+    "task_type": "real_issue",
+    "title": "Malformed JSON string causes `ollama._types.ResponseError: error parsing tool call`",
+    "label_applied": null,
+    "upstream_issue_number": 34746,
+    "upstream_issue_url": "https://github.com/langchain-ai/langchain/issues/34746"
+  }
+]

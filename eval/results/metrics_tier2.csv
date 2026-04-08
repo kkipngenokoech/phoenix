@@ -1,0 +1,16 @@
+repo,fork,issue_number,task_type,level,status,tests_pass_after,correctness_preserved,complexity_avg_before,complexity_avg_after,complexity_delta_avg,complexity_max_before,complexity_max_after,complexity_delta_max,elapsed_seconds,pr_number,pr_url,recovery_ops
+pytest-dev/pytest,kkipngenokoech/pytest,7,real_issue,hard,succeeded,True,True,2.74,2.74,0.0,57,57,0,198.2,10,https://github.com/kkipngenokoech/pytest/pull/10,1
+pytest-dev/pytest,kkipngenokoech/pytest,8,real_issue,hard,succeeded,True,True,2.74,2.74,0.0,57,57,0,158.8,11,https://github.com/kkipngenokoech/pytest/pull/11,1
+pytest-dev/pytest,kkipngenokoech/pytest,9,real_issue,hard,succeeded,True,True,2.74,2.74,0.0,57,57,0,101.9,12,https://github.com/kkipngenokoech/pytest/pull/12,1
+scikit-learn/scikit-learn,kkipngenokoech/scikit-learn,1,real_issue,hard,succeeded,True,True,3.24,3.24,0.0,71,71,0,158.1,4,https://github.com/kkipngenokoech/scikit-learn/pull/4,1
+scikit-learn/scikit-learn,kkipngenokoech/scikit-learn,2,real_issue,hard,succeeded,True,True,3.24,3.24,0.0,71,71,0,98.6,5,https://github.com/kkipngenokoech/scikit-learn/pull/5,1
+scikit-learn/scikit-learn,kkipngenokoech/scikit-learn,3,real_issue,hard,succeeded,True,True,3.24,3.24,0.0,71,71,0,162.9,6,https://github.com/kkipngenokoech/scikit-learn/pull/6,1
+vuejs/core,kkipngenokoech/core,1,real_issue,hard,succeeded,True,True,0.0,0.0,0.0,0.0,0.0,0.0,160.5,4,https://github.com/kkipngenokoech/core/pull/4,1
+vuejs/core,kkipngenokoech/core,2,real_issue,hard,succeeded,True,True,0.0,0.0,0.0,0.0,0.0,0.0,174.8,6,https://github.com/kkipngenokoech/core/pull/6,1
+vuejs/core,kkipngenokoech/core,3,real_issue,hard,succeeded,True,True,0.0,0.0,0.0,0.0,0.0,0.0,142.6,7,https://github.com/kkipngenokoech/core/pull/7,1
+grafana/grafana,kkipngenokoech/grafana,1,real_issue,hard,succeeded,True,True,0.0,0.0,0.0,0.0,0.0,0.0,75.8,4,https://github.com/kkipngenokoech/grafana/pull/4,1
+grafana/grafana,kkipngenokoech/grafana,2,real_issue,hard,succeeded,True,True,0.0,0.0,0.0,0.0,0.0,0.0,78.5,5,https://github.com/kkipngenokoech/grafana/pull/5,1
+grafana/grafana,kkipngenokoech/grafana,3,real_issue,hard,succeeded,True,True,0.0,0.0,0.0,0.0,0.0,0.0,73.5,6,https://github.com/kkipngenokoech/grafana/pull/6,1
+keycloak/keycloak,kkipngenokoech/keycloak,1,real_issue,hard,succeeded,True,True,0.0,0.0,0.0,0,0,0,68.3,4,https://github.com/kkipngenokoech/keycloak/pull/4,1
+keycloak/keycloak,kkipngenokoech/keycloak,2,real_issue,hard,succeeded,True,True,0.0,0.0,0.0,0,0,0,96.9,5,https://github.com/kkipngenokoech/keycloak/pull/5,1
+keycloak/keycloak,kkipngenokoech/keycloak,3,real_issue,hard,succeeded,True,True,0.0,0.0,0.0,0,0,0,81.0,6,https://github.com/kkipngenokoech/keycloak/pull/6,1

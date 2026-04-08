@@ -1,5 +1,7 @@
-.PHONY: install status watch run-issue labels setup-actions reset-state clean-repo-state clean-workspace-all onboard pre-release release serve serve-local slides
+.PHONY: install status watch run-issue labels setup-actions reset-state clean-repo-state clean-workspace-all onboard pre-release release serve serve-local slides eval
 PYTHON ?= .venv/bin/python
+TIER   ?= pilot
+STAGES ?= baseline,issues,run,metrics
 
 install:
 	$(PYTHON) -m pip install -e .
@@ -86,3 +88,14 @@ serve-local:
 
 slides:
 	cd slides && python3 -m http.server 8080
+
+# ── Evaluation pipeline ───────────────────────────────────────────────────────
+# One command:  make eval           (pilot, 10 repos)
+#               make eval TIER=tier1
+#               make eval TIER=tier2
+#
+# Starts Phoenix + ngrok, forks repos, creates issues, waits via SSE, computes
+# metrics, then shuts everything down automatically.
+
+eval:
+	$(PYTHON) -m eval.main --tier $(TIER) --stages $(STAGES) --workspace workspace $(if $(FORCE),--force,) $(if $(ISSUES_FILE),--issues-file $(ISSUES_FILE),)

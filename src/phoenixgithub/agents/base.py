@@ -139,6 +139,41 @@ class BaseAgent(ABC):
             config["metadata"] = trace_metadata
         return config
 
+    @staticmethod
+    def _sanitize_body_for_waf(body: str, max_chars: int = 1500) -> str:
+        """Remove code blocks / tracebacks and truncate to avoid WAF 403s.
+
+        Stack traces and JSON payloads in GitHub issue bodies frequently match
+        WAF rules for code injection, path traversal, and prompt injection.
+        """
+        import re
+
+        def _replace_block(m: re.Match) -> str:
+            lang = (m.group(1) or "code").strip() or "code"
+            return f"[{lang} block omitted]"
+
+        sanitized = re.sub(
+            r"```([a-zA-Z0-9_.-]*)\n?(.*?)```",
+            _replace_block,
+            body,
+            flags=re.DOTALL,
+        )
+
+        lines = sanitized.splitlines()
+        cleaned: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('File "') and ", line " in stripped:
+                continue
+            if stripped and all(c in "^~" for c in stripped):
+                continue
+            cleaned.append(line)
+        sanitized = "\n".join(cleaned)
+
+        if len(sanitized) > max_chars:
+            sanitized = sanitized[:max_chars] + "\n...(truncated)"
+        return sanitized
+
     @abstractmethod
     def run(self, context: dict[str, Any]) -> dict[str, Any]:
         """Execute this agent's task. Returns outputs to merge into run context."""

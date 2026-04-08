@@ -1,0 +1,58 @@
+[
+  {
+    "repo": "axios/axios",
+    "fork": "kkipngenokoech/axios",
+    "issue_number": 18,
+    "issue_url": "https://github.com/kkipngenokoech/axios/issues/18",
+    "task_type": "real_issue",
+    "status": "failed",
+    "pr_number": null,
+    "pr_url": null,
+    "final_label": "ai:failed",
+    "elapsed_seconds": 247.8,
+    "error": "Tests failed after 2 retries",
+    "completed_at": "2026-04-07T09:38:42Z"
+  },
+  {
+    "repo": "langchain-ai/langchain",
+    "fork": "kkipngenokoech/langchain",
+    "issue_number": 16,
+    "issue_url": "https://github.com/kkipngenokoech/langchain/issues/16",
+    "task_type": "real_issue",
+    "status": "failed",
+    "pr_number": null,
+    "pr_url": null,
+    "final_label": "ai:failed",
+    "elapsed_seconds": 259.9,
+    "error": "Tests failed after 2 retries",
+    "completed_at": "2026-04-07T09:43:16Z"
+  },
+  {
+    "repo": "langchain-ai/langchain",
+    "fork": "kkipngenokoech/langchain",
+    "issue_number": 17,
+    "issue_url": "https://github.com/kkipngenokoech/langchain/issues/17",
+    "task_type": "real_issue",
+    "status": "failed",
+    "pr_number": null,
+    "pr_url": null,
+    "final_label": "ai:failed",
+    "elapsed_seconds": 309.1,
+    "error": "Tests failed after 2 retries",
+    "completed_at": "2026-04-07T09:48:39Z"
+  },
+  {
+    "repo": "langchain-ai/langchain",
+    "fork": "kkipngenokoech/langchain",
+    "issue_number": 18,
+    "issue_url": "https://github.com/kkipngenokoech/langchain/issues/18",
+    "task_type": "real_issue",
+    "status": "failed",
+    "pr_number": null,
+    "pr_url": null,
+    "final_label": "ai:failed",
+    "elapsed_seconds": 121.8,
+    "error": "Tests failed after 2 retries",
+    "completed_at": "2026-04-07T09:50:55Z"
+  }
+]

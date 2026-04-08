@@ -6,6 +6,7 @@ and manages the verify-reject-retry loop.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
@@ -152,6 +153,7 @@ class Orchestrator:
                 run.status = RunStatus.FAILED
                 run.error = str(e)
                 self.state.save_run(run)
+                self._write_run_log(run, context, error=e)
                 return self._finalize_failure(run, issue_number, context)
 
     # ------------------------------------------------------------------
@@ -163,23 +165,50 @@ class Orchestrator:
         run.set_step_running(StepID.PLAN)
         self.state.save_run(run)
 
+        import time as _time
+        # Warm-up ping to wake the gateway before the real plan request
         try:
-            outputs = self.planner.run(context)
-            context.update(outputs)
-            run.set_step_done(StepID.PLAN, outputs)
+            self.planner.llm.invoke("ping")
+        except Exception:
+            pass
+        _time.sleep(3)
 
-            plan = outputs.get("plan", {})
-            self.github.comment_on_issue(
-                context["issue_number"],
-                f"📋 **Plan ready**\n\n"
-                f"**Approach:** {plan.get('approach', 'N/A')}\n"
-                f"**Files:** {', '.join(plan.get('files_to_modify', []))}\n"
-                f"**Risk:** {plan.get('risk_level', 'unknown')}",
-            )
-        except Exception as e:
-            run.set_step_failed(StepID.PLAN, str(e))
-            run.status = RunStatus.FAILED
-            run.error = f"Plan failed: {e}"
+        max_plan_attempts = 5
+        for plan_attempt in range(1, max_plan_attempts + 1):
+            try:
+                outputs = self.planner.run(context)
+                context.update(outputs)
+                run.set_step_done(StepID.PLAN, outputs)
+
+                plan = outputs.get("plan", {})
+                self.github.comment_on_issue(
+                    context["issue_number"],
+                    f"📋 **Plan ready**\n\n"
+                    f"**Approach:** {plan.get('approach', 'N/A')}\n"
+                    f"**Files:** {', '.join(plan.get('files_to_modify', []))}\n"
+                    f"**Risk:** {plan.get('risk_level', 'unknown')}",
+                )
+                break  # success
+            except Exception as e:
+                is_rate_limit = any(
+                    code in str(e) for code in ("403", "429", "rate limit", "Forbidden")
+                )
+                if is_rate_limit and plan_attempt < max_plan_attempts:
+                    # WAF content blocks don't improve with longer waits.
+                    # Cap at 30s and strip code context on second attempt.
+                    wait = min(30 * plan_attempt, 60)
+                    logger.warning(
+                        f"[{run.run_id}] Plan attempt {plan_attempt} hit gateway limit "
+                        f"({e}). Retrying in {wait}s (no-code mode)..."
+                    )
+                    _time.sleep(wait)
+                    # Tell planner to skip source file excerpts on next attempt
+                    context["planner_no_code"] = True
+                    continue
+                run.set_step_failed(StepID.PLAN, str(e))
+                run.status = RunStatus.FAILED
+                run.error = f"Plan failed: {e}"
+                break
 
         self.state.save_run(run)
         return run
@@ -354,6 +383,49 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # Failure handling
     # ------------------------------------------------------------------
+
+    def _write_run_log(self, run: Run, context: dict, error: Exception | None = None) -> None:
+        """Write a per-run failure log to eval/results/run_logs/ for offline analysis."""
+        import datetime
+        from pathlib import Path
+
+        log_dir = Path("eval/results/run_logs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{run.run_id}.md"
+
+        repo = context.get("repo", run.repo)
+        issue_number = context.get("issue_number", "?")
+        plan = context.get("plan", {})
+        test_output = context.get("test_output", {})
+        feedback = context.get("feedback", "")
+
+        lines = [
+            f"# Run {run.run_id} — FAILED",
+            f"**Date:** {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+            f"**Repo:** {repo}",
+            f"**Issue:** #{issue_number}",
+            f"**Branch:** {run.branch_name}",
+            "",
+            "## Error",
+            f"```",
+            str(error or run.error or "unknown")[:2000],
+            "```",
+            "",
+            "## Plan",
+            f"```json",
+            json.dumps(plan, indent=2)[:3000] if plan else "not reached",
+            "```",
+            "",
+            "## Test output",
+            f"```",
+            (test_output.get("stdout", "") + test_output.get("stderr", ""))[:3000] if test_output else "not reached",
+            "```",
+            "",
+            "## Tester feedback",
+            feedback[:1000] if feedback else "none",
+        ]
+        log_path.write_text("\n".join(lines))
+        logger.info(f"Run log written: {log_path}")
 
     def _finalize_failure(self, run: Run, issue_number: int, context: dict[str, Any] | None = None) -> Run:
         self.state.mark_run_finished(run.run_id)

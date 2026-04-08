@@ -50,7 +50,7 @@ Rules:
             f"## Issue\n"
             f"Number: {issue_number}\n"
             f"Title: {issue_title}\n"
-            f"Body: {issue_body[:3000]}\n\n"
+            f"Body: {self._sanitize_body_for_waf(issue_body, max_chars=800)}\n\n"
             f"## Failed Run Summary\n{run_summary[:12000]}\n\n"
             f"## Test Feedback\n{test_feedback[:4000]}\n\n"
             f"## Test Output (raw)\n```json\n{json.dumps(test_output, indent=2)[:12000]}\n```\n\n"

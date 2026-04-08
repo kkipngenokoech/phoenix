@@ -1,0 +1,57 @@
+[
+  {
+    "repo": "pytest-dev/pytest",
+    "fork": "kkipngenokoech/pytest",
+    "tests_pass": false,
+    "test_output": "ERROR: /Users/kip/Documents/phoenixgithub/workspace/pytest/pyproject.toml: 'minversion' requires pytest-2.0, actual pytest-0.1.dev1+g728652641'\n\n",
+    "complexity_avg": 2.74,
+    "complexity_max": 57,
+    "file_count": 263,
+    "loc": 105292,
+    "measured_at": "2026-04-08T03:41:33Z"
+  },
+  {
+    "repo": "scikit-learn/scikit-learn",
+    "fork": "kkipngenokoech/scikit-learn",
+    "tests_pass": false,
+    "test_output": "/Users/kip/Documents/phoenixgithub/.venv/lib/python3.14/site-packages/_hypothesis_pytestplugin.py:84: UserWarning: \n        You are using pytest version 0.1.dev1+g728652641. Hypothesis tests work with any test\n        runner, but our pytest plugin requires pytest 4.6 or newer.\n        Note that the pytest developers no longer support your version either!\n        Disabling the Hypothesis pytest plugin...\n    \n  warnings.warn(PYTEST_TOO_OLD_MESSAGE % (pytest.__version__,), stacklevel=1)\nImportError while loading conftest '/Users/kip/Documents/phoenixgithub/workspace/scikit-learn/sklearn/conftest.py'.\n../../.venv/lib/python3.14/site-packages/_scikit_learn_editable_loader.py:312: in find_spec\n    tree = self._rebuild()\n           ^^^^^^^^^^^^^^^\n../../.venv/lib/python3.14/site-packages/_scikit_learn_editable_loader.py:346: in _rebuild\n    subprocess.run(self._build_cmd, cwd=self._build_path, env=env, stdout=subprocess.DEVNULL, check=True)\n/opt/homebrew/Cellar/python@3.14/3.14.2_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py:554: in run\n    with Popen(*popenargs, **kwargs) as process:\n         ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n/opt/homebrew/Cellar/python@3.14/3.14.2_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py:1038: in __init__\n    self._execute_child(args, executable, preexec_fn, close_fds,\n/opt/homebrew/Cellar/python@3.14/3.14.2_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py:1989: in _execute_child\n    raise child_exception_type(errno_num, err_msg, err_filename)\nE   FileNotFoundError: [Errno 2] No such file or directory: '/private/var/folders/0l/rcvq372950d2p9ytf6rfzzxh0000gn/T/pip-build-env-blpsw74w/normal/bin/ninja'\n",
+    "complexity_avg": 3.24,
+    "complexity_max": 71,
+    "file_count": 1007,
+    "loc": 436714,
+    "measured_at": "2026-04-08T03:43:03Z"
+  },
+  {
+    "repo": "vuejs/core",
+    "fork": "kkipngenokoech/core",
+    "tests_pass": false,
+    "test_output": "\n> build\n> node scripts/build.js\n\nnode:internal/modules/package_json_reader:266\n  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);\n        ^\n\nError [ERR_MODULE_NOT_FOUND]: Cannot find package 'picocolors' imported from /Users/kip/Documents/phoenixgithub/workspace/core/scripts/build.js\n    at Object.getPackageJSONURL (node:internal/modules/package_json_reader:266:9)\n    at packageResolve (node:internal/modules/esm/resolve:767:81)\n    at moduleResolve (node:internal/modules/esm/resolve:853:18)\n    at defaultResolve (node:internal/modules/esm/resolve:983:11)\n    at #cachedDefaultResolve (node:internal/modules/esm/loader:731:20)\n    at ModuleLoader.resolve (node:internal/modules/esm/loader:708:38)\n    at ModuleLoader.getModuleJobForImport (node:internal/modules/esm/loader:310:38)\n    at ModuleJob._link (node:internal/modules/esm/module_job:183:49) {\n  code: 'ERR_MODULE_NOT_FOUND'\n}\n\nNode.js v22.20.0\n",
+    "complexity_avg": 0.0,
+    "complexity_max": 0.0,
+    "file_count": 517,
+    "loc": 152862,
+    "measured_at": "2026-04-08T03:43:28Z"
+  },
+  {
+    "repo": "grafana/grafana",
+    "fork": "kkipngenokoech/grafana",
+    "tests_pass": false,
+    "test_output": "\n> grafana@13.0.0-pre build\n> NODE_ENV=production nx exec --verbose -- webpack --config scripts/webpack/webpack.prod.js && yarn build:react19\n\nsh: nx: command not found\n",
+    "complexity_avg": 0.0,
+    "complexity_max": 0.0,
+    "file_count": 8853,
+    "loc": 1360227,
+    "measured_at": "2026-04-08T03:44:27Z"
+  },
+  {
+    "repo": "keycloak/keycloak",
+    "fork": "kkipngenokoech/keycloak",
+    "tests_pass": true,
+    "test_output": "Java build tools (mvn/gradle) not available; Java tests skipped.",
+    "complexity_avg": 0.0,
+    "complexity_max": 0,
+    "file_count": 0,
+    "loc": 0,
+    "measured_at": "2026-04-08T04:21:47Z"
+  }
+]

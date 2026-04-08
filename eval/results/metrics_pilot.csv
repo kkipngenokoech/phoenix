@@ -1,0 +1,16 @@
+repo,fork,issue_number,task_type,level,status,tests_pass_after,correctness_preserved,complexity_avg_before,complexity_avg_after,complexity_delta_avg,complexity_max_before,complexity_max_after,complexity_delta_max,elapsed_seconds,pr_number,pr_url,recovery_ops
+andialbrecht/sqlparse,kkipngenokoech/sqlparse,16,real_issue,easy,succeeded,True,True,3.61,3.65,0.04,28,28,0,122.1,21,https://github.com/kkipngenokoech/sqlparse/pull/21,1
+andialbrecht/sqlparse,kkipngenokoech/sqlparse,17,real_issue,easy,succeeded,True,True,3.61,3.64,0.03,28,28,0,162.0,22,https://github.com/kkipngenokoech/sqlparse/pull/22,1
+andialbrecht/sqlparse,kkipngenokoech/sqlparse,18,real_issue,easy,failed,,,3.61,3.61,0.0,28,28,0,168.0,,,1
+psf/requests,kkipngenokoech/requests,16,real_issue,easy,succeeded,True,True,2.9,2.9,0.0,21,21,0,262.3,19,https://github.com/kkipngenokoech/requests/pull/19,1
+psf/requests,kkipngenokoech/requests,17,real_issue,easy,succeeded,True,True,2.9,2.91,0.01,21,21,0,219.4,20,https://github.com/kkipngenokoech/requests/pull/20,1
+psf/requests,kkipngenokoech/requests,18,real_issue,easy,succeeded,True,True,2.9,2.9,0.0,21,21,0,175.8,21,https://github.com/kkipngenokoech/requests/pull/21,1
+marshmallow-code/marshmallow,kkipngenokoech/marshmallow,17,real_issue,medium,succeeded,True,True,3.22,3.23,0.01,60,60,0,160.6,20,https://github.com/kkipngenokoech/marshmallow/pull/20,1
+marshmallow-code/marshmallow,kkipngenokoech/marshmallow,18,real_issue,medium,succeeded,True,True,3.22,3.23,0.01,60,60,0,190.3,21,https://github.com/kkipngenokoech/marshmallow/pull/21,1
+marshmallow-code/marshmallow,kkipngenokoech/marshmallow,19,real_issue,medium,succeeded,True,True,3.22,3.23,0.01,60,60,0,85.2,22,https://github.com/kkipngenokoech/marshmallow/pull/22,1
+axios/axios,kkipngenokoech/axios,16,real_issue,easy,succeeded,True,True,0.0,0.0,0.0,0.0,0.0,0.0,342.8,19,https://github.com/kkipngenokoech/axios/pull/19,1
+axios/axios,kkipngenokoech/axios,17,real_issue,easy,succeeded,True,True,0.0,0.0,0.0,0.0,0.0,0.0,265.0,20,https://github.com/kkipngenokoech/axios/pull/20,1
+axios/axios,kkipngenokoech/axios,18,real_issue,easy,succeeded,True,True,0.0,0.0,0.0,0.0,0.0,0.0,358.2,21,https://github.com/kkipngenokoech/axios/pull/21,1
+langchain-ai/langchain,kkipngenokoech/langchain,16,real_issue,medium,succeeded,True,True,3.33,3.33,0.0,98,98,0,147.1,19,https://github.com/kkipngenokoech/langchain/pull/19,1
+langchain-ai/langchain,kkipngenokoech/langchain,17,real_issue,medium,succeeded,True,True,3.33,3.33,0.0,98,98,0,184.6,20,https://github.com/kkipngenokoech/langchain/pull/20,1
+langchain-ai/langchain,kkipngenokoech/langchain,18,real_issue,medium,succeeded,True,True,3.33,3.33,0.0,98,98,0,80.4,21,https://github.com/kkipngenokoech/langchain/pull/21,1

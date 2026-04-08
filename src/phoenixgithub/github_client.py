@@ -37,6 +37,17 @@ class GitHubClient:
         self._labels = config.labels
         self._app_auth: object | None = None
         self._installation_id: int | None = None
+        self._token_refreshed_at: float = 0.0
+
+    def _ensure_fresh_token(self) -> None:
+        """Refresh the installation token if it's older than 50 minutes."""
+        import time
+        if not self._app_auth or not self._installation_id:
+            return
+        if time.monotonic() - self._token_refreshed_at < 50 * 60:
+            return
+        self.refresh_token()
+        self._token_refreshed_at = time.monotonic()
 
     @classmethod
     def from_app_auth(
@@ -69,6 +80,7 @@ class GitHubClient:
         instance._labels = config.labels
         instance._app_auth = app_auth
         instance._installation_id = installation_id
+        instance._token_refreshed_at = 0.0
         return instance
 
     # ------------------------------------------------------------------
@@ -99,6 +111,7 @@ class GitHubClient:
 
     def transition_label(self, issue_number: int, from_label: str, to_label: str) -> None:
         """Set a single AI state label, clearing all other AI state labels."""
+        self._ensure_fresh_token()
         issue = self._repo.get_issue(issue_number)
         ai_state_labels = {
             self._labels.ready,
@@ -129,6 +142,7 @@ class GitHubClient:
         self._repo.get_issue(issue_number).add_to_labels(label)
 
     def comment_on_issue(self, issue_number: int, body: str) -> None:
+        self._ensure_fresh_token()
         self._repo.get_issue(issue_number).create_comment(body)
 
     def get_issue_comments(self, issue_number: int, limit: int = 30) -> list[dict[str, str]]:
@@ -224,12 +238,16 @@ class GitHubClient:
         if clone_path.exists() and (clone_path / ".git").exists():
             repo = Repo(str(clone_path))
             if full_reset:
+                # Refresh the remote URL with a fresh installation token so
+                # pull doesn't fail with 401 when the previous token expired.
+                token = self._get_clone_token()
+                fresh_url = f"https://x-access-token:{token}@github.com/{self.config.github.repo}.git"
+                repo.git.remote("set-url", "origin", fresh_url)
+
                 logger.info(f"Pulling latest on {repo.active_branch.name}...")
-                try:
-                    repo.git.checkout("main")
-                except GitCommandError:
-                    repo.git.checkout("master")
-                repo.git.pull("origin")
+                default_branch = get_default_branch(repo)
+                repo.git.checkout("-f", default_branch)
+                repo.git.pull("origin", default_branch)
                 # Runs can leave untracked files behind after failed attempts.
                 # Keep the local workspace deterministic before planning starts.
                 repo.git.reset("--hard")
@@ -250,7 +268,7 @@ class GitHubClient:
         repo = Repo(clone_path)
         default_branch = get_default_branch(repo)
         if full_reset:
-            repo.git.checkout(default_branch)
+            repo.git.checkout("-f", default_branch)
             repo.git.pull("origin", default_branch)
             repo.git.reset("--hard", f"origin/{default_branch}")
             repo.git.clean("-fd")
@@ -331,6 +349,7 @@ class GitHubClient:
         labels: list[str] | None = None,
     ) -> PullRequest:
         """Create a PR from the feature branch to the default branch."""
+        self._ensure_fresh_token()
         closes_refs = " ".join(f"Closes #{n}" for n in issue_numbers)
         full_body = f"{body}\n\n---\n{closes_refs}"
 

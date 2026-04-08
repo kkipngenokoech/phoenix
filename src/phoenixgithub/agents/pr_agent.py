@@ -35,7 +35,7 @@ Rules:
     def run(self, context: dict[str, Any]) -> dict[str, Any]:
         issue_number = context.get("issue_number", "?")
         issue_title = context["issue_title"]
-        issue_body = context["issue_body"]
+        issue_body = self._sanitize_body_for_waf(context["issue_body"], max_chars=800)
         plan = context.get("plan", {})
         test_verdict = context.get("test_verdict", {})
         applied_files = context.get("applied_files", [])

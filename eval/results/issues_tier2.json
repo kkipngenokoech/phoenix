@@ -1,0 +1,167 @@
+[
+  {
+    "repo": "pytest-dev/pytest",
+    "fork": "kkipngenokoech/pytest",
+    "issue_number": 7,
+    "issue_url": "https://github.com/kkipngenokoech/pytest/issues/7",
+    "task_type": "real_issue",
+    "title": "get_closest_marker is working unexpectedly",
+    "label_applied": null,
+    "upstream_issue_number": 14329,
+    "upstream_issue_url": "https://github.com/pytest-dev/pytest/issues/14329"
+  },
+  {
+    "repo": "pytest-dev/pytest",
+    "fork": "kkipngenokoech/pytest",
+    "issue_number": 8,
+    "issue_url": "https://github.com/kkipngenokoech/pytest/issues/8",
+    "task_type": "real_issue",
+    "title": "pytest 9.02 TypeError, 9.01 works",
+    "label_applied": null,
+    "upstream_issue_number": 14334,
+    "upstream_issue_url": "https://github.com/pytest-dev/pytest/issues/14334"
+  },
+  {
+    "repo": "pytest-dev/pytest",
+    "fork": "kkipngenokoech/pytest",
+    "issue_number": 9,
+    "issue_url": "https://github.com/kkipngenokoech/pytest/issues/9",
+    "task_type": "real_issue",
+    "title": "pytest failed to parse the filterwarnings option due to subtle issues related to python path",
+    "label_applied": null,
+    "upstream_issue_number": 13274,
+    "upstream_issue_url": "https://github.com/pytest-dev/pytest/issues/13274"
+  },
+  {
+    "repo": "scikit-learn/scikit-learn",
+    "fork": "kkipngenokoech/scikit-learn",
+    "issue_number": 1,
+    "issue_url": "https://github.com/kkipngenokoech/scikit-learn/issues/1",
+    "task_type": "real_issue",
+    "title": "Fitting different instances of `LinearSVR` is not thread-safe",
+    "label_applied": null,
+    "upstream_issue_number": 31883,
+    "upstream_issue_url": "https://github.com/scikit-learn/scikit-learn/issues/31883"
+  },
+  {
+    "repo": "scikit-learn/scikit-learn",
+    "fork": "kkipngenokoech/scikit-learn",
+    "issue_number": 2,
+    "issue_url": "https://github.com/kkipngenokoech/scikit-learn/issues/2",
+    "task_type": "real_issue",
+    "title": "TunedThresholdClassifierCV (cv=float, refit=False) `best_threshold_` may not align with `estimator_` due to split reuse bug",
+    "label_applied": null,
+    "upstream_issue_number": 33540,
+    "upstream_issue_url": "https://github.com/scikit-learn/scikit-learn/issues/33540"
+  },
+  {
+    "repo": "scikit-learn/scikit-learn",
+    "fork": "kkipngenokoech/scikit-learn",
+    "issue_number": 3,
+    "issue_url": "https://github.com/kkipngenokoech/scikit-learn/issues/3",
+    "task_type": "real_issue",
+    "title": "DictionaryLearner dies with 'omp' only ",
+    "label_applied": null,
+    "upstream_issue_number": 33454,
+    "upstream_issue_url": "https://github.com/scikit-learn/scikit-learn/issues/33454"
+  },
+  {
+    "repo": "vuejs/core",
+    "fork": "kkipngenokoech/core",
+    "issue_number": 1,
+    "issue_url": "https://github.com/kkipngenokoech/core/issues/1",
+    "task_type": "real_issue",
+    "title": "Second instance of a duplicate component VNode isn't rendered on the client-side when using SSR",
+    "label_applied": null,
+    "upstream_issue_number": 14635,
+    "upstream_issue_url": "https://github.com/vuejs/core/issues/14635"
+  },
+  {
+    "repo": "vuejs/core",
+    "fork": "kkipngenokoech/core",
+    "issue_number": 2,
+    "issue_url": "https://github.com/kkipngenokoech/core/issues/2",
+    "task_type": "real_issue",
+    "title": "[custom elements api] TypeError: Cannot read properties of null (reading 'insertBefore') using v-if on named slot",
+    "label_applied": null,
+    "upstream_issue_number": 13234,
+    "upstream_issue_url": "https://github.com/vuejs/core/issues/13234"
+  },
+  {
+    "repo": "vuejs/core",
+    "fork": "kkipngenokoech/core",
+    "issue_number": 3,
+    "issue_url": "https://github.com/kkipngenokoech/core/issues/3",
+    "task_type": "real_issue",
+    "title": "CSS nesting and `:deep()` in scoped styles not working",
+    "label_applied": null,
+    "upstream_issue_number": 13159,
+    "upstream_issue_url": "https://github.com/vuejs/core/issues/13159"
+  },
+  {
+    "repo": "grafana/grafana",
+    "fork": "kkipngenokoech/grafana",
+    "issue_number": 1,
+    "issue_url": "https://github.com/kkipngenokoech/grafana/issues/1",
+    "task_type": "real_issue",
+    "title": "[Bug] Recently Viewed Section: Clicking Carrot Icon On Title Doesn't Expand/Collapse Section",
+    "label_applied": null,
+    "upstream_issue_number": 122012,
+    "upstream_issue_url": "https://github.com/grafana/grafana/issues/122012"
+  },
+  {
+    "repo": "grafana/grafana",
+    "fork": "kkipngenokoech/grafana",
+    "issue_number": 2,
+    "issue_url": "https://github.com/kkipngenokoech/grafana/issues/2",
+    "task_type": "real_issue",
+    "title": "Hide \"New Data source recording rule\" option and \"Data source-managed\" tab when alertingDisableDMAlerts is enabled.",
+    "label_applied": null,
+    "upstream_issue_number": 115015,
+    "upstream_issue_url": "https://github.com/grafana/grafana/issues/115015"
+  },
+  {
+    "repo": "grafana/grafana",
+    "fork": "kkipngenokoech/grafana",
+    "issue_number": 3,
+    "issue_url": "https://github.com/kkipngenokoech/grafana/issues/3",
+    "task_type": "real_issue",
+    "title": "MultiComboBox: Component shows No Options Found before fetching the data",
+    "label_applied": null,
+    "upstream_issue_number": 103554,
+    "upstream_issue_url": "https://github.com/grafana/grafana/issues/103554"
+  },
+  {
+    "repo": "keycloak/keycloak",
+    "fork": "kkipngenokoech/keycloak",
+    "issue_number": 1,
+    "issue_url": "https://github.com/kkipngenokoech/keycloak/issues/1",
+    "task_type": "real_issue",
+    "title": "Account UI reports \"Something went wrong\" when opening an unknown path",
+    "label_applied": null,
+    "upstream_issue_number": 40602,
+    "upstream_issue_url": "https://github.com/keycloak/keycloak/issues/40602"
+  },
+  {
+    "repo": "keycloak/keycloak",
+    "fork": "kkipngenokoech/keycloak",
+    "issue_number": 2,
+    "issue_url": "https://github.com/kkipngenokoech/keycloak/issues/2",
+    "task_type": "real_issue",
+    "title": "Device activity does not recognize iOS 26 correct",
+    "label_applied": null,
+    "upstream_issue_number": 44741,
+    "upstream_issue_url": "https://github.com/keycloak/keycloak/issues/44741"
+  },
+  {
+    "repo": "keycloak/keycloak",
+    "fork": "kkipngenokoech/keycloak",
+    "issue_number": 3,
+    "issue_url": "https://github.com/kkipngenokoech/keycloak/issues/3",
+    "task_type": "real_issue",
+    "title": "[FGAP V2] `manage` scope on Clients does not imply `view`",
+    "label_applied": null,
+    "upstream_issue_number": 47804,
+    "upstream_issue_url": "https://github.com/keycloak/keycloak/issues/47804"
+  }
+]

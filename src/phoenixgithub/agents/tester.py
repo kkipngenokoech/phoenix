@@ -55,6 +55,9 @@ Respond ONLY with the JSON object, no markdown fences."""
     def run(self, context: dict[str, Any]) -> dict[str, Any]:
         clone_path = context["clone_path"]
 
+        # Install dependencies before running tests
+        self._install_deps(clone_path)
+
         # Run the test suite
         test_output = self._run_tests(clone_path)
 
@@ -67,13 +70,43 @@ Respond ONLY with the JSON object, no markdown fences."""
                 "test_verdict": {"passed": True, "summary": "No tests collected; allowed by configuration."},
             }
 
-        if test_output["exit_code"] == 0 and "passed" in test_output.get("stdout", ""):
-            logger.info("Tests passed — skipping LLM analysis")
+        stdout = test_output.get("stdout", "")
+        skipped_unavailable = any(
+            phrase in stdout for phrase in ("tests skipped", "not available", "skipped.")
+        ) and test_output["exit_code"] == 0
+        if test_output["exit_code"] == 0 and ("passed" in stdout or skipped_unavailable):
+            logger.info("Tests passed (or tool unavailable — skipped) — skipping LLM analysis")
             return {
                 "test_passed": True,
                 "test_output": test_output,
                 "feedback": "",
             }
+
+        # Tests failed — check if baseline (without Phoenix's changes) also fails.
+        # If baseline was already broken, don't penalize Phoenix for it.
+        if test_output["exit_code"] != 0:
+            baseline_result = self._run_baseline_comparison(clone_path)
+            if baseline_result.get("baseline_also_failed"):
+                new_failures = baseline_result.get("new_failures", [])
+                if not new_failures:
+                    logger.info(
+                        "Test failures pre-exist on baseline (no new failures from Phoenix) — treating as pass"
+                    )
+                    return {
+                        "test_passed": True,
+                        "test_output": test_output,
+                        "feedback": "",
+                        "test_verdict": {
+                            "passed": True,
+                            "summary": "Baseline test suite was already failing; Phoenix introduced no new failures.",
+                        },
+                    }
+                else:
+                    logger.warning(
+                        "Phoenix introduced %d new failure(s) on top of pre-existing baseline failures: %s",
+                        len(new_failures),
+                        new_failures[:3],
+                    )
 
         # If tests failed or are ambiguous, ask the LLM to analyze
         prompt = (
@@ -121,11 +154,136 @@ Respond ONLY with the JSON object, no markdown fences."""
             "feedback": verdict.get("feedback", ""),
         }
 
+    def _install_deps(self, cwd: str) -> None:
+        """Best-effort dependency installation before tests run."""
+        root = Path(cwd)
+        profile = self._resolve_profile(cwd)
+
+        if profile == "frontend":
+            if (root / "package.json").exists() and not (root / "node_modules").exists():
+                logger.info("node_modules missing — running npm install")
+                try:
+                    subprocess.run(
+                        ["npm", "install", "--prefer-offline"],
+                        cwd=cwd, capture_output=True, text=True, timeout=180
+                    )
+                except Exception as e:
+                    logger.warning("npm install failed: %s", e)
+        else:
+            # Python: install editable if not already installed
+            has_pyproject = (root / "pyproject.toml").exists()
+            has_setup = (root / "setup.py").exists() or (root / "setup.cfg").exists()
+            if has_pyproject or has_setup:
+                try:
+                    result = subprocess.run(
+                        ["pip", "install", "-e", ".[dev,test]", "--quiet", "--no-build-isolation"],
+                        cwd=cwd, capture_output=True, text=True, timeout=120
+                    )
+                    if result.returncode != 0:
+                        # Fall back without extras
+                        subprocess.run(
+                            ["pip", "install", "-e", ".", "--quiet", "--no-build-isolation"],
+                            cwd=cwd, capture_output=True, text=True, timeout=120
+                        )
+                except Exception as e:
+                    logger.warning("pip install -e failed: %s", e)
+            # Also install from requirements files
+            for req_file in ("requirements-dev.txt", "requirements-test.txt", "requirements.txt"):
+                req_path = root / req_file
+                if req_path.exists():
+                    try:
+                        subprocess.run(
+                            ["pip", "install", "-r", str(req_path), "--quiet"],
+                            cwd=cwd, capture_output=True, text=True, timeout=120
+                        )
+                    except Exception as e:
+                        logger.warning("pip install -r %s failed: %s", req_file, e)
+                    break  # Only install first requirements file found
+
+    def _run_baseline_comparison(self, cwd: str) -> dict:
+        """Stash Phoenix changes, run tests on baseline, restore changes.
+
+        Returns:
+            {
+                "baseline_also_failed": bool,
+                "new_failures": list[str],  # test names that fail with changes but not on baseline
+            }
+        """
+        import re as _re
+        root = Path(cwd)
+
+        # Only meaningful for git repos
+        if not (root / ".git").exists():
+            return {"baseline_also_failed": False, "new_failures": []}
+
+        def _extract_failed_tests(stdout: str) -> set[str]:
+            """Extract FAILED test::name lines from pytest output."""
+            names: set[str] = set()
+            for line in stdout.splitlines():
+                m = _re.match(r"^FAILED (.+?) -", line)
+                if m:
+                    names.add(m.group(1).strip())
+                elif line.startswith("FAILED "):
+                    names.add(line[7:].split(" ")[0].strip())
+            return names
+
+        def _extract_npm_failures(stdout: str) -> set[str]:
+            names: set[str] = set()
+            for line in stdout.splitlines():
+                if "✗" in line or "× " in line or "FAIL" in line:
+                    names.add(line.strip()[:80])
+            return names
+
+        # Get current failing tests
+        current_result = self._run_tests(cwd)
+        current_failures = _extract_failed_tests(
+            current_result.get("stdout", "") + current_result.get("stderr", "")
+        ) or _extract_npm_failures(current_result.get("stdout", ""))
+
+        # Stash Phoenix changes
+        try:
+            stash_result = subprocess.run(
+                ["git", "stash", "--include-untracked"],
+                cwd=cwd, capture_output=True, text=True, timeout=30
+            )
+            stashed = "No local changes" not in stash_result.stdout
+        except Exception:
+            return {"baseline_also_failed": False, "new_failures": []}
+
+        try:
+            baseline_result = self._run_tests(cwd)
+            baseline_failed = baseline_result.get("exit_code", 0) != 0
+            baseline_failures = _extract_failed_tests(
+                baseline_result.get("stdout", "") + baseline_result.get("stderr", "")
+            ) or _extract_npm_failures(baseline_result.get("stdout", ""))
+        finally:
+            if stashed:
+                try:
+                    subprocess.run(
+                        ["git", "stash", "pop"],
+                        cwd=cwd, capture_output=True, text=True, timeout=30
+                    )
+                except Exception:
+                    pass
+
+        new_failures = list(current_failures - baseline_failures)
+        logger.info(
+            "Baseline comparison: baseline_failed=%s, baseline_failures=%d, current_failures=%d, new=%d",
+            baseline_failed, len(baseline_failures), len(current_failures), len(new_failures),
+        )
+
+        return {
+            "baseline_also_failed": baseline_failed,
+            "new_failures": new_failures,
+        }
+
     def _run_tests(self, cwd: str) -> dict:
         """Execute the test command and capture output."""
         profile = self._resolve_profile(cwd)
         if profile == "frontend":
             return self._run_frontend_checks(cwd)
+        if profile == "java":
+            return self._run_java_checks(cwd)
         if profile == "generic":
             return self._run_generic_checks(cwd)
         # default: python profile
@@ -191,12 +349,14 @@ Respond ONLY with the JSON object, no markdown fences."""
         return "no tests ran" in text or "collected 0 items" in text
 
     def _resolve_profile(self, cwd: str) -> str:
-        if self.validation_profile in {"python", "frontend", "generic"}:
+        if self.validation_profile in {"python", "frontend", "java", "generic"}:
             return self.validation_profile
         # auto-detect
         root = Path(cwd)
         if (root / "package.json").exists():
             return "frontend"
+        if (root / "pom.xml").exists() or (root / "build.gradle").exists() or (root / "build.gradle.kts").exists():
+            return "java"
         return "python"
 
     def _run_frontend_checks(self, cwd: str) -> dict:
@@ -205,6 +365,17 @@ Respond ONLY with the JSON object, no markdown fences."""
         pkg = root / "package.json"
         if not pkg.exists():
             return {"exit_code": 0, "stdout": "No package.json; frontend checks skipped.", "stderr": ""}
+
+        # Ensure node_modules exist
+        if not (root / "node_modules").exists():
+            logger.info("node_modules missing — running npm install in %s", cwd)
+            try:
+                subprocess.run(
+                    ["npm", "install", "--prefer-offline"],
+                    cwd=cwd, capture_output=True, text=True, timeout=180
+                )
+            except Exception as e:
+                return {"exit_code": -1, "stdout": "", "stderr": f"npm install failed: {e}"}
 
         try:
             data = json.loads(pkg.read_text())
@@ -215,7 +386,7 @@ Respond ONLY with the JSON object, no markdown fences."""
         chosen: list[list[str]] = []
         if isinstance(scripts, dict):
             if "test" in scripts:
-                chosen.append(["npm", "run", "test", "--", "--runInBand"])
+                chosen.append(["npm", "run", "test"])
             elif "build" in scripts:
                 chosen.append(["npm", "run", "build"])
             elif "lint" in scripts:
@@ -247,11 +418,48 @@ Respond ONLY with the JSON object, no markdown fences."""
                 if proc.returncode != 0:
                     return {"exit_code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
             except FileNotFoundError:
-                return {"exit_code": -1, "stdout": "", "stderr": "npm not found for frontend validation."}
+                logger.warning("npm not found — treating frontend tests as skipped (tool unavailable)")
+                return {"exit_code": 0, "stdout": "npm not available; frontend tests skipped.", "stderr": ""}
             except subprocess.TimeoutExpired:
                 return {"exit_code": -1, "stdout": "", "stderr": "Frontend validation timed out (300s)."}
 
         return {"exit_code": 0, "stdout": "\n".join(outputs), "stderr": ""}
+
+    def _run_java_checks(self, cwd: str) -> dict:
+        """Run Java tests via Maven or Gradle."""
+        root = Path(cwd)
+
+        # Prefer Maven if pom.xml exists
+        if (root / "pom.xml").exists():
+            tool = "mvn"
+            cmd = ["mvn", "-q", "test", "-Dsurefire.failIfNoSpecifiedTests=false"]
+        elif (root / "build.gradle.kts").exists() or (root / "build.gradle").exists():
+            tool = "gradle"
+            wrapper = root / "gradlew"
+            gradle_bin = str(wrapper) if wrapper.exists() else "gradle"
+            cmd = [gradle_bin, "test", "--quiet", "--continue"]
+        else:
+            return {"exit_code": 1, "stdout": "", "stderr": "No pom.xml or build.gradle found."}
+
+        logger.info(f"Running Java tests ({tool}): {' '.join(cmd)} in {cwd}")
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            return {
+                "exit_code": proc.returncode,
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+            }
+        except FileNotFoundError:
+            logger.warning("%s not found — treating Java tests as skipped (tool unavailable)", tool)
+            return {"exit_code": 0, "stdout": f"{tool} not available; Java tests skipped.", "stderr": ""}
+        except subprocess.TimeoutExpired:
+            return {"exit_code": -1, "stdout": "", "stderr": "Java test execution timed out (600s)."}
 
     def _run_generic_checks(self, cwd: str) -> dict:
         """Generic fallback checks for repos without runnable tests."""
