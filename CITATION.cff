@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: 'If you use this software, please cite it as below.'
+authors:
+  - family-names: 'Kipngeno Koech'
+  - family-names: 'Muhammad Adam'
+  - family-names: 'Baimam Boukar Jean Jacques'
+  - family-names: 'Joao Barros'
+title: 'Phoenix: Safe, End-to-End GitHub Issue Resolution via Multi-Agent LLM Pipeline with Layered Safety Controls'
+version: 1.0
+date-released: 2026-04-10
+url: 'https://github.com/kkipngenokoech/phoenix'
