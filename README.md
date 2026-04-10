@@ -1,6 +1,6 @@
 # PhoenixGitHub
 
-> Kipngeno Koech, Muhammad Adam, Baimam Boukar Jean Jacques, Joao Barros — Carnegie Mellon University Africa
+> Kipngeno Koech, Muhammad Adam, Baimam Boukar Jean Jacques, Joao Barros.
 
 *PhoenixGitHub is an always-on AI engineering agent that autonomously resolves GitHub issues — from triage to pull request — using a multi-agent LLM pipeline with layered safety controls. It watches labeled issues, plans and implements changes, verifies correctness against a baseline-aware test strategy, and opens a PR for human review.*
 
@@ -17,7 +17,9 @@ phoenixgithub watch     # start the watcher
 Add the `ai:ready` label to any issue in your repository. Phoenix picks it up automatically.
 
 <details>
-<summary>More details — workflow, CLI, configuration, token permissions</summary>
+<summary>
+ <h3>More details — workflow, CLI, configuration, token permissions</h3>
+</summary>
 
 ### How it works
 
@@ -115,30 +117,8 @@ For fine-grained PATs:
 
 ## Architecture
 
-```
-GitHub Issue
-     │  ai:ready label (webhook)
-     ▼
-Orchestrator
-     │  clone + plan
-     ▼
-  Planner  →  JSON plan
-     │
-     ▼
-  Coder    →  file changes
-     │
-     ▼
-  Tester   →  verdict
-     │
-     ├── pass ──→  PR Agent  →  ai:review  ✓
-     │
-     └── fail ──→  Failure Analyst  ──→  feedback (≤2 retries)  ──→  Coder
-                        │
-                   retries exhausted
-                        │
-                        ▼
-                    ai:failed  ✗
-```
+<img width="1440" height="1482" alt="image" src="https://github.com/user-attachments/assets/77fa9716-13d4-48cc-88bb-96ed1f171bb2" />
+
 
 ### Agents
 
