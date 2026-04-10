@@ -117,7 +117,7 @@ For fine-grained PATs:
 
 ## Architecture
 
-<img width="1440" height="1482" alt="image" src="https://github.com/user-attachments/assets/77fa9716-13d4-48cc-88bb-96ed1f171bb2" />
+<img width="800" height="800" alt="image" src="https://github.com/user-attachments/assets/77fa9716-13d4-48cc-88bb-96ed1f171bb2" />
 
 
 ### Agents
