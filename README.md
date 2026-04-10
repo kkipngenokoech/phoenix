@@ -1,196 +1,216 @@
 # PhoenixGitHub
 
-PhoenixGitHub is an always-on AI engineering agent for GitHub repositories.  
-It watches labeled issues, plans and implements changes, validates the result, and opens a pull request for human review.
+> Kipngeno Koech, Muhammad Adam, Baimam Boukar Jean Jacques, Joao Barros — Carnegie Mellon University Africa
 
-## Project Description
+*PhoenixGitHub is an always-on AI engineering agent that autonomously resolves GitHub issues — from triage to pull request — using a multi-agent LLM pipeline with layered safety controls. It watches labeled issues, plans and implements changes, verifies correctness against a baseline-aware test strategy, and opens a PR for human review.*
 
-PhoenixGitHub turns issue labels into a lightweight development workflow:
-
-- Pick up work from `ai:ready` or `ai:revise`.
-- Run a structured pipeline: plan -> code -> test -> PR.
-- Keep issue state synchronized with labels (`ai:in-progress`, `ai:review`, `ai:failed`, `ai:done`).
-- Provide guided retry loops when a run fails.
-- Support interactive first-time setup with `phoenixgithub init`.
-
-This is designed for teams who want AI automation in normal GitHub workflows, without replacing human approval on merges.
-
-## Installation
-
-```bash
-pip install phoenixgithub
-```
+---
 
 ## Quick Start
 
-### 1) Initialize configuration
-
 ```bash
-phoenixgithub init
+pip install phoenixgithub
+phoenixgithub init      # interactive setup wizard
+phoenixgithub watch     # start the watcher
 ```
 
-The setup wizard writes `.env` in your current directory and prompts for required credentials with hidden input for secrets.
+Add the `ai:ready` label to any issue in your repository. Phoenix picks it up automatically.
 
-### 2) Verify configuration
+<details>
+<summary>More details — workflow, CLI, configuration, token permissions</summary>
 
-```bash
-phoenixgithub status
-```
+### How it works
 
-### 3) Start the watcher
+PhoenixGitHub turns issue labels into a lightweight development workflow:
 
-```bash
-phoenixgithub watch
-```
+- Pick up work from `ai:ready` or `ai:revise`
+- Run a structured pipeline: plan → code → test → PR
+- Keep issue state synchronized with labels (`ai:in-progress`, `ai:review`, `ai:failed`, `ai:done`)
+- Provide guided retry loops when a run fails
+- Support interactive first-time setup with `phoenixgithub init`
 
-### 4) Trigger an issue run
+Designed for teams who want AI automation in normal GitHub workflows, without replacing human approval on merges.
 
-In your GitHub repo, add label `ai:ready` to an issue. PhoenixGitHub will pick it up automatically.
-
-## End-to-End Flow
+### End-to-End Flow
 
 When an issue enters `ai:ready` or `ai:revise`, PhoenixGitHub:
 
-1. Transitions the issue to `ai:in-progress`.
-2. Prepares a working branch (`phoenix/issue-<number>`).
-3. Builds a plan from issue details and existing code.
-4. Applies code changes through the coder agent.
-5. Runs validation and test checks.
-6. Commits and pushes results.
-7. Creates (or reuses) a pull request.
-8. Transitions the issue to:
-   - `ai:review` on success
-   - `ai:failed` on failure
+1. Transitions the issue to `ai:in-progress`
+2. Prepares a working branch (`phoenix/issue-<number>`)
+3. Builds a plan from issue details and existing code
+4. Applies code changes through the Coder agent
+5. Runs validation and test checks
+6. Commits and pushes results
+7. Creates (or reuses) a pull request
+8. Transitions the issue to `ai:review` on success, or `ai:failed` on failure
 
-## Label State Machine
+### Label State Machine
 
-```text
-ai:ready / ai:revise -> ai:in-progress -> ai:review -> ai:done
-                                       -> ai:failed -> ai:revise (optional auto-revise)
+```
+ai:ready / ai:revise  →  ai:in-progress  →  ai:review  →  ai:done
+                                         →  ai:failed   →  ai:revise (optional)
 ```
 
-AI state labels are enforced as mutually exclusive.
+AI state labels are mutually exclusive — at most one is active per issue at any time.
 
-## CLI Reference
+### CLI Reference
 
 | Command | Purpose |
-| --- | --- |
+|---------|---------|
 | `phoenixgithub init` | Interactive setup wizard that creates `.env` |
 | `phoenixgithub watch` | Run the daemon and process labeled issues continuously |
 | `phoenixgithub run-issue <number>` | One-shot run for a single issue |
 | `phoenixgithub status` | Show watcher state and recent runs |
 | `phoenixgithub reset-issue <number>` | Clear local dispatch lock for an issue |
 
-## Key Features
+### Configuration
 
-- **Issue-driven automation**: labels control the entire workflow.
-- **Deterministic orchestration**: clear step boundaries (plan, implement, test, PR).
-- **Failure feedback loop**: failure analyst comments with suggested fixes.
-- **Revise mode**: targeted retries using `ai:revise`.
-- **Validation profiles**: `auto`, `python`, `frontend`, `generic`.
-- **Safety rails**: path protections, label exclusivity, no-progress cycle limits.
+Most users should use `phoenixgithub init`. Manual setup is supported via `.env.example`.
 
-## Configuration
+**Core**
 
-Most users should use `phoenixgithub init`. Manual setup is also supported using `.env.example`.
+| Variable | Description |
+|----------|-------------|
+| `GITHUB_TOKEN` | GitHub PAT for issue/PR/label operations |
+| `GITHUB_REPO` | Repository in `owner/repo` format |
+| `LLM_PROVIDER` | Model provider (e.g. `anthropic`) |
+| `LLM_MODEL` | Model ID accepted by your endpoint |
+| `LLM_API_KEY` | Provider or gateway API key |
+| `POLL_INTERVAL` | Watcher poll interval in seconds |
+| `MAX_CONCURRENT_RUNS` | Watcher dispatch pressure |
 
-### Core Variables
+**Agent behavior**
 
-- `GITHUB_TOKEN`: GitHub PAT used for issue/PR/label operations.
-- `GITHUB_REPO`: repository in `owner/repo` format.
-- `LLM_PROVIDER`: model provider (for example `anthropic`).
-- `LLM_MODEL`: model ID accepted by your endpoint.
-- `LLM_API_KEY`: provider or gateway API key.
-- `POLL_INTERVAL`: watcher poll interval in seconds.
-- `MAX_CONCURRENT_RUNS`: watcher dispatch pressure.
+| Variable | Description |
+|----------|-------------|
+| `TEST_COMMAND` | Command used by the Tester |
+| `AUTO_REVISE_ON_TEST_FAILURE` | Auto-relabel to `ai:revise` on failure |
+| `AUTO_REVISE_MAX_CYCLES` | Max auto-revise attempts |
+| `NO_PROGRESS_ROOT_CAUSE_REPEAT_LIMIT` | Stop repeated root causes sooner |
+| `REVISE_INCREMENTAL` | Reuse branch/worktree on revise runs |
+| `ALLOW_NO_TESTS` | Treat pytest exit 5 as pass |
+| `VALIDATION_PROFILE` | `auto`, `python`, `frontend`, `generic` |
 
-### Agent Behavior Variables
+**Tracing**
 
-- `TEST_COMMAND`: command used by tester.
-- `AUTO_REVISE_ON_TEST_FAILURE`: auto-relable to `ai:revise`.
-- `AUTO_REVISE_MAX_CYCLES`: max auto-revise attempts.
-- `NO_PROGRESS_ROOT_CAUSE_REPEAT_LIMIT`: stop repeated root causes sooner.
-- `REVISE_INCREMENTAL`: reuse branch/worktree on revise runs.
-- `ALLOW_NO_TESTS`: treat pytest exit 5 as pass if enabled.
-- `VALIDATION_PROFILE`: `auto`, `python`, `frontend`, `generic`.
+| Variable | Description |
+|----------|-------------|
+| `LANGCHAIN_TRACING_V2` | Enable LangSmith tracing |
+| `LANGCHAIN_API_KEY` | LangSmith API key |
+| `LANGCHAIN_PROJECT` | Project name (e.g. `phoenix-owner/repo`) |
 
-### Tracing Variables
+### GitHub Token Permissions
 
-- `LANGCHAIN_TRACING_V2`
-- `LANGCHAIN_API_KEY`
-- `LANGCHAIN_PROJECT` (commonly `phoenix-${GITHUB_REPO}`)
-
-## GitHub Token Permissions
-
-Your token should allow issue, PR, and content operations. For fine-grained PATs, recommended permissions are:
+For fine-grained PATs:
 
 - Repository contents: read/write
 - Issues: read/write
 - Pull requests: read/write
-- Workflows: read/write (if installing workflow helpers)
+- Workflows: read/write (only if installing workflow helpers)
 - Metadata: read-only
 
-## Example Usage Pattern
+</details>
 
-1. Create or select an issue in your target repo.
-2. Add label `ai:ready`.
-3. Run `phoenixgithub watch`.
-4. Wait for label transition to `ai:review`.
-5. Review and merge the created PR.
-6. Mark the issue done (or automate done labeling with your workflow).
+---
 
-## Troubleshooting
+## Architecture
 
-- **Issue not picked up**: verify `ai:ready` or `ai:revise` is present.
-- **Auth errors**: verify PAT scopes and LLM credentials.
-- **Stuck local dispatch state**: run `phoenixgithub reset-issue <number>`.
-- **Workspace inconsistencies**: clean `WORKSPACE_DIR` and restart watcher.
-- **No tests collected**: consider `ALLOW_NO_TESTS=true` for non-test repos.
-
-## Safety and Guardrails
-
-- Path traversal prevention blocks writes outside repository root.
-- AI labels are mutually exclusive during state transitions.
-- New folder guardrail requires meaningful `README.md`.
-- Failure analyst provides structured root-cause feedback.
-- Revise loops are bounded by configurable cycle limits.
-
-## Project Structure
-
-```text
-src/phoenixgithub/
-  cli.py            # CLI commands
-  config.py         # configuration model from environment
-  github_client.py  # GitHub API and git operations
-  orchestrator.py   # plan/implement/test/pr pipeline
-  watcher.py        # polling and dispatch
-  state.py          # local run and watcher state
-  agents/           # planner/coder/tester/pr/failure analyst
-  tools/            # shared helper utilities (git/path/runtime helpers)
-scripts/
-  pre_release.py                    # local release checks
-  create_labels.py                  # create/ensure AI labels in target repo
-  install_merge_done_workflow.py    # install merge->ai:done workflow
-  reset_repo_state.py               # clear local run/clone state for current repo
-.github/workflows/
-  publish-pypi.yml                  # GitHub Release -> PyPI publish (OIDC)
-docs/
-  README.md                         # docs index
-INTERNAL_README.md                  # internal architecture and operations guide
-RELEASING.md                        # release runbook
+```
+GitHub Issue
+     │  ai:ready label (webhook)
+     ▼
+Orchestrator
+     │  clone + plan
+     ▼
+  Planner  →  JSON plan
+     │
+     ▼
+  Coder    →  file changes
+     │
+     ▼
+  Tester   →  verdict
+     │
+     ├── pass ──→  PR Agent  →  ai:review  ✓
+     │
+     └── fail ──→  Failure Analyst  ──→  feedback (≤2 retries)  ──→  Coder
+                        │
+                   retries exhausted
+                        │
+                        ▼
+                    ai:failed  ✗
 ```
 
-## Internal Tools Package
+### Agents
 
-PhoenixGitHub includes reusable runtime helpers under `src/phoenixgithub/tools/`:
+| Agent | Responsibility |
+|-------|---------------|
+| **Planner** | Reads the issue and repository structure, scores file relevance, outputs a structured JSON plan |
+| **Coder** | Produces complete file changes based on the plan, with a self-verification step |
+| **Tester** | Runs the test suite with baseline comparison to distinguish pre-existing failures from new regressions |
+| **Failure Analyst** | Analyzes failing tests, identifies root causes, and feeds structured suggestions back to the Coder |
+| **PR Agent** | Opens the pull request and transitions the issue label to `ai:review` |
 
-- `git_utils.py`: default-branch detection, changed-path parsing, uncovered-path coverage checks.
-- `path_utils.py`: image URL detection, image extension inference, image URL extraction from issue/comment text.
+---
 
-These helpers are used by `github_client.py` to keep the core client focused on orchestration/API behavior.
+## Results
 
-## Maintainer Documentation
+<details>
+<summary>42 real issues · 14 repositories · 100% correctness preservation · 122s mean resolution time (hard tier)</summary>
 
-- `INTERNAL_README.md`: architecture and operations runbook.
-- `RELEASING.md`: release and publishing process.
-- `docs/README.md`: documentation index.
+### Summary by Difficulty
+
+| Tier | Issues | Correctness Preserved | Avg. Time |
+|------|--------|-----------------------|-----------|
+| Easy | 12 | 12/12 (100%) | < 4 min |
+| Medium | 15 | 15/15 (100%) | < 4 min |
+| Hard | 15 | 15/15 (100%) | 122 s |
+| **Total** | **42** | **42/42 (100%)** | |
+
+### Hard-Tier Resolution Times
+
+| Repository | Min (s) | Max (s) | Mean (s) |
+|------------|---------|---------|----------|
+| `keycloak/keycloak` | 68 | 97 | 82 |
+| `grafana/grafana` | 74 | 79 | 76 |
+| `scikit-learn/scikit-learn` | 99 | 163 | 140 |
+| `pytest-dev/pytest` | 102 | 198 | 153 |
+| `vuejs/core` | 143 | 175 | 159 |
+| **Overall** | **68** | **198** | **122** |
+
+### Per-Repository Results
+
+| Repository | Language | Tier | CP | Baseline Broken? |
+|------------|----------|------|----|-----------------|
+| `andialbrecht/sqlparse` | Python | easy | 3/3 | No |
+| `psf/requests` | Python | easy | 3/3 | Yes |
+| `axios/axios` | JavaScript | easy | 3/3 | Yes |
+| `google/gson` | Java | easy | 3/3 | N/A (Java) |
+| `marshmallow-code/marshmallow` | Python | medium | 3/3 | Yes |
+| `facebook/docusaurus` | TypeScript | medium | 3/3 | Yes |
+| `calcom/cal.com` | TypeScript | medium | 3/3 | Yes |
+| `apache/lucene` | Java | medium | 3/3 | N/A (Java) |
+| `langchain-ai/langchain` | Python | medium | 3/3 | Yes |
+| `pytest-dev/pytest` | Python | hard | 3/3 | Yes |
+| `scikit-learn/scikit-learn` | Python | hard | 3/3 | Yes |
+| `vuejs/core` | TypeScript | hard | 3/3 | Yes |
+| `grafana/grafana` | TypeScript | hard | 3/3 | Yes |
+| `keycloak/keycloak` | Java | hard | 3/3 | N/A (Java) |
+
+Of the 11 non-Java repositories, 10 had pre-existing test failures on their default branch. The baseline-aware evaluation strategy correctly classified all 10 as correctness-preserved — Phoenix introduced no new failures in any case.
+
+</details>
+
+---
+
+## Citation
+
+```bibtex
+@software{phoenix2026,
+  author    = {Kipngeno Koech and Muhammad Adam and
+               Baimam Boukar Jean Jacques and Joao Barros},
+  title     = {Phoenix: Safe, End-to-End GitHub Issue Resolution via
+               Multi-Agent LLM Pipeline with Layered Safety Controls},
+  year      = {2026},
+  url       = {https://github.com/kkipngenokoech/phoenix}
+}
+```
