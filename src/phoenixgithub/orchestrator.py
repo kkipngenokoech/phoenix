@@ -16,6 +16,7 @@ from phoenixgithub.agents.coder import CoderAgent
 from phoenixgithub.agents.failure_analyst import FailureAnalystAgent
 from phoenixgithub.agents.planner import PlannerAgent
 from phoenixgithub.agents.pr_agent import PRAgent
+from phoenixgithub.agents.reproducer import ReproducerAgent
 from phoenixgithub.agents.tester import TesterAgent
 from phoenixgithub.config import Config
 from phoenixgithub.github_client import GitHubClient
@@ -47,12 +48,14 @@ class Orchestrator:
 
         llm = create_llm(config.llm)
         self.planner = PlannerAgent(llm)
+        self.reproducer = ReproducerAgent(llm)
         self.coder = CoderAgent(llm)
         self.tester = TesterAgent(
             llm,
             test_command=config.agent.test_command,
             allow_no_tests=config.agent.allow_no_tests,
             validation_profile=config.agent.validation_profile,
+            resolution_mode=config.agent.resolution_mode,
         )
         self.pr_agent = PRAgent(llm)
         self.failure_analyst = FailureAnalystAgent(llm)
@@ -109,7 +112,11 @@ class Orchestrator:
                 if run.status == RunStatus.FAILED:
                     return self._finalize_failure(run, issue_number, context)
 
-                # 3. IMPLEMENT + TEST (with retry loop)
+                # 3. REPRODUCE (non-blocking — failure does not stop the pipeline)
+                if self.config.agent.use_reproducer:
+                    run = self._step_reproduce(run, context)
+
+                # 4. IMPLEMENT + TEST (with retry loop)
                 run = self._step_implement_and_test(run, context)
                 if run.status == RunStatus.FAILED:
                     return self._finalize_failure(run, issue_number, context)
@@ -178,6 +185,28 @@ class Orchestrator:
             try:
                 outputs = self.planner.run(context)
                 context.update(outputs)
+
+                # Validate files_to_modify — strip paths that don't exist in the repo.
+                # The LLM sometimes hallucinates paths despite being told not to.
+                plan = outputs.get("plan", {})
+                clone_path = context.get("clone_path", "")
+                if clone_path and plan:
+                    from pathlib import Path as _Path
+                    valid, phantom = [], []
+                    for p in plan.get("files_to_modify", []):
+                        if (_Path(clone_path) / p).exists():
+                            valid.append(p)
+                        else:
+                            phantom.append(p)
+                    if phantom:
+                        logger.warning(
+                            "[%s] Planner hallucinated %d path(s) not in repo: %s — removing",
+                            run.run_id, len(phantom), phantom,
+                        )
+                        plan["files_to_modify"] = valid
+                        outputs["plan"] = plan
+                        context["plan"] = plan
+
                 run.set_step_done(StepID.PLAN, outputs)
 
                 plan = outputs.get("plan", {})
@@ -213,6 +242,94 @@ class Orchestrator:
         self.state.save_run(run)
         return run
 
+    def _read_plan_files_for_reproducer(self, context: dict[str, Any]) -> str:
+        """Load source excerpts for files in the plan — planner never returns `relevant_code`."""
+        from pathlib import Path
+
+        clone_path = context.get("clone_path", "")
+        plan = context.get("plan") or {}
+        paths = [p for p in (plan.get("files_to_modify") or []) if p]
+        if not clone_path or not paths:
+            return ""
+
+        root = Path(clone_path)
+        chunks: list[str] = []
+        max_per_file = 20_000
+        max_total = 100_000
+        total = 0
+
+        for rel in paths[:8]:
+            path = root / rel
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text(errors="replace")
+            except OSError:
+                continue
+            excerpt = text[:max_per_file]
+            if len(text) > max_per_file:
+                excerpt += "\n... (truncated)"
+            block = f"### {rel}\n```\n{excerpt}\n```"
+            if total + len(block) > max_total:
+                break
+            chunks.append(block)
+            total += len(block)
+
+        return "\n\n".join(chunks)
+
+    def _step_reproduce(self, run: Run, context: dict) -> Run:
+        """Write and verify a failing reproduction test (non-blocking step).
+
+        On success: adds reproducer_test, reproducer_file, reproduced=True to context.
+        On failure: sets reproducer_skipped=True and continues — does NOT fail the run.
+        """
+        logger.info(f"[{run.run_id}] REPRODUCE — writing reproduction test for #{context['issue_number']}")
+        run.set_step_running(StepID.REPRODUCE)
+        self.state.save_run(run)
+
+        # Planner builds excerpts internally but does not put them in context;
+        # read the plan's files_to_modify from disk so the reproducer sees real source.
+        disk = self._read_plan_files_for_reproducer(context)
+        legacy = (context.get("relevant_code") or "").strip()
+        context["relevant_code_for_reproducer"] = disk or legacy
+
+        try:
+            outputs = self.reproducer.run(context)
+            context.update(outputs)
+
+            reproduced = outputs.get("reproduced", False)
+            skipped = outputs.get("reproducer_skipped", False)
+            test_file = outputs.get("reproducer_file", "")
+
+            run.set_step_done(StepID.REPRODUCE, {
+                "reproduced": reproduced,
+                "skipped": skipped,
+                "test_file": test_file,
+                "false_positive": outputs.get("false_positive", False),
+            })
+
+            if reproduced:
+                self.github.comment_on_issue(
+                    context["issue_number"],
+                    f"🔬 **Reproduction test written**\n\n"
+                    f"Phoenix confirmed the issue is reproducible via `{test_file}`.\n"
+                    f"The fix will be verified against this test.",
+                )
+                logger.info(f"[{run.run_id}] Reproduction confirmed: {test_file}")
+            else:
+                logger.info(
+                    f"[{run.run_id}] Reproduction skipped (non-blocking) — "
+                    f"continuing without reproducer test"
+                )
+
+        except Exception as e:
+            logger.warning(f"[{run.run_id}] Reproducer step error (non-blocking): {e}")
+            context["reproducer_skipped"] = True
+            run.set_step_done(StepID.REPRODUCE, {"skipped": True, "error": str(e)})
+
+        self.state.save_run(run)
+        return run  # always continue — reproducer failure is non-blocking
+
     def _step_implement_and_test(self, run: Run, context: dict) -> Run:
         """Implement + test with verify-reject-retry loop."""
         max_retries = self.config.agent.max_retries
@@ -227,6 +344,67 @@ class Orchestrator:
             try:
                 coder_outputs = self.coder.run(context)
                 context.update(coder_outputs)
+
+                # Detect hallucinated output: coder ignored plan's files_to_modify
+                # and produced unrelated generic files (database.py, models.py, etc.)
+                from pathlib import Path as _Path
+                clone_path = context.get("clone_path", "")
+                plan_files = set(context.get("plan", {}).get("files_to_modify", []))
+                applied = coder_outputs.get("applied_files", [])
+                changes = coder_outputs.get("changes", [])
+
+                if plan_files and clone_path:
+                    # plan_all = files the coder is allowed to touch
+                    plan_all = plan_files | set(context.get("plan", {}).get("files_to_create", []))
+                    # Check if coder ignored the plan entirely (no overlap at all)
+                    overlap = set(applied) & plan_all
+                    if not overlap:
+                        # Strip phantom changes — use plan membership only, NOT disk existence,
+                        # because the coder already wrote these files to disk before we check.
+                        valid_changes, phantom_changes = [], []
+                        for ch in changes:
+                            fp = ch.get("file_path", "")
+                            if fp in plan_all:
+                                valid_changes.append(ch)
+                            else:
+                                phantom_changes.append(fp)
+                                # Delete phantom file from disk so it doesn't land in the PR
+                                try:
+                                    phantom_path = _Path(clone_path) / fp
+                                    if phantom_path.exists():
+                                        phantom_path.unlink()
+                                except Exception:
+                                    pass
+
+                        if phantom_changes:
+                            logger.warning(
+                                "[%s] Coder hallucinated %d file(s) not in plan: %s",
+                                run.run_id, len(phantom_changes), phantom_changes[:5],
+                            )
+                            coder_outputs["changes"] = valid_changes
+                            coder_outputs["applied_files"] = [
+                                ch["file_path"] for ch in valid_changes if ch.get("file_path")
+                            ]
+                            context.update(coder_outputs)
+
+                        # If still no overlap with plan's modify-list, inject retry feedback
+                        remaining_applied = set(coder_outputs.get("applied_files", []))
+                        if not (remaining_applied & plan_files) and attempt < max_retries:
+                            feedback = (
+                                f"CRITICAL: Your previous attempt did not modify any of the required files.\n"
+                                f"You MUST modify these existing files: {', '.join(sorted(plan_files))}\n"
+                                f"The full contents of each file are shown under 'Current File Contents'.\n"
+                                f"Make targeted surgical edits to the existing code to fix the issue.\n"
+                                f"Do NOT create new placeholder files like main.py, database.py, models.py, or utils.py."
+                            )
+                            context["verify_feedback"] = feedback
+                            logger.warning(
+                                "[%s] Coder ignored all plan files — injecting retry feedback (attempt %d)",
+                                run.run_id, attempt,
+                            )
+                            run.step(StepID.IMPLEMENT).retries += 1
+                            continue  # skip tester, retry coder with explicit feedback
+
                 all_applied_files.update(coder_outputs.get("applied_files", []))
                 context["applied_files"] = sorted(all_applied_files)
 
@@ -257,10 +435,13 @@ class Orchestrator:
                 test_outputs = self.tester.run(context)
                 context.update(test_outputs)
 
-                if test_outputs.get("test_passed"):
+                if test_outputs.get("issue_resolved", test_outputs.get("test_passed")):
                     run.set_step_done(StepID.TEST, test_outputs)
                     self.state.save_run(run)
-                    logger.info(f"[{run.run_id}] Tests passed on attempt {attempt}")
+                    logger.info(
+                        f"[{run.run_id}] Resolution gate passed on attempt {attempt} "
+                        f"(mode={self.config.agent.resolution_mode})"
+                    )
                     return run
 
                 # Tests failed — feed back to coder for retry

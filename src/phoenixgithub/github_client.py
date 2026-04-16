@@ -247,10 +247,10 @@ class GitHubClient:
                 logger.info(f"Pulling latest on {repo.active_branch.name}...")
                 default_branch = get_default_branch(repo)
                 repo.git.checkout("-f", default_branch)
-                repo.git.pull("origin", default_branch)
-                # Runs can leave untracked files behind after failed attempts.
-                # Keep the local workspace deterministic before planning starts.
-                repo.git.reset("--hard")
+                repo.git.fetch("origin", default_branch)
+                # Use reset --hard instead of pull to handle force-pushed branches
+                # (e.g. SWE-bench eval resets forks to specific base commits).
+                repo.git.reset("--hard", f"origin/{default_branch}")
                 repo.git.clean("-fd")
             else:
                 logger.info("Reusing existing clone/worktree for incremental revise")
@@ -269,7 +269,7 @@ class GitHubClient:
         default_branch = get_default_branch(repo)
         if full_reset:
             repo.git.checkout("-f", default_branch)
-            repo.git.pull("origin", default_branch)
+            repo.git.fetch("origin", default_branch)
             repo.git.reset("--hard", f"origin/{default_branch}")
             repo.git.clean("-fd")
 
@@ -294,7 +294,8 @@ class GitHubClient:
             logger.info(f"Reusing existing branch for revise: {branch_name}")
         else:
             repo.git.checkout(default_branch)
-            repo.git.pull("origin", default_branch)
+            repo.git.fetch("origin", default_branch)
+            repo.git.reset("--hard", f"origin/{default_branch}")
             repo.git.checkout("-b", branch_name)
             logger.info(f"Created branch for revise: {branch_name}")
         return repo

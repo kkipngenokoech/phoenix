@@ -20,6 +20,18 @@ _STOP_WORDS = {
     "return", "import", "class", "function", "method", "object",
 }
 
+_NAVIGATION_SYSTEM_PROMPT = """You are a code navigator. Your sole job is to find the \
+source files in a repository that are relevant to a GitHub issue.
+
+Use the tools to explore — list directories, search for symbols, read files. \
+Navigate like a developer would:
+1. Scan the top-level structure to understand the repo layout.
+2. Search for identifiers, error messages, or class names mentioned in the issue.
+3. Read the most promising files to confirm relevance.
+4. Stop once you have read 2–4 relevant files.
+
+Do NOT write any code. Do NOT suggest fixes. Just navigate and read."""
+
 from phoenixgithub.agents.base import BaseAgent
 
 logger = logging.getLogger(__name__)
@@ -79,9 +91,7 @@ Rules:
         relevant_code = (
             "(code context omitted to avoid gateway content filter)"
             if no_code
-            else self._read_relevant_files(
-                clone_path, issue_hint=f"{issue_title} {issue_body[:200]}"
-            )
+            else self._agentic_localize(clone_path, issue_title, issue_body)
         )
         visual_context = self._analyze_screenshots(
             issue_title,
@@ -288,6 +298,189 @@ Rules:
         lines.append(root_path.name + "/")
         walk(root_path, 0)
         return "\n".join(lines[:200])
+
+    def _agentic_localize(
+        self,
+        root: str,
+        issue_title: str,
+        issue_body: str,
+        max_steps: int = 10,
+        max_chars_per_file: int = 1500,
+    ) -> str:
+        """Navigate the repository with tool calls to find relevant files.
+
+        Gives the LLM four read-only tools (list_directory, read_file,
+        search_code, find_files) and lets it explore the repo interactively —
+        the same approach used by top SWE-bench systems.  Falls back to
+        keyword-scoring if tool calling is unsupported or nothing is found.
+
+        Returns a formatted excerpts string compatible with _read_relevant_files.
+        """
+        from langchain_core.messages import AIMessage, ToolMessage
+        from langchain_core.tools import tool as lc_tool
+
+        root_path = Path(root).resolve()
+        skip_dirs = {
+            "node_modules", ".venv", "venv", ".git", "__pycache__",
+            "dist", "build", ".next", ".nuxt",
+        }
+        read_files: dict[str, str] = {}   # rel_path → full content
+
+        # ── safety helper ──────────────────────────────────────────────────
+        def _safe(p: str) -> Path | None:
+            try:
+                resolved = (root_path / p.lstrip("/")).resolve()
+                resolved.relative_to(root_path)
+                return resolved
+            except Exception:
+                return None
+
+        # ── tool definitions ───────────────────────────────────────────────
+        @lc_tool
+        def list_directory(path: str = ".") -> str:
+            """List the contents of a directory in the repository. Use '.' for root."""
+            target = _safe(path)
+            if not target or not target.is_dir():
+                return f"Directory not found: {path}"
+            entries: list[str] = []
+            try:
+                for e in sorted(target.iterdir(), key=lambda x: (not x.is_dir(), x.name)):
+                    if e.name in skip_dirs:
+                        continue
+                    entries.append(f"  {'[dir]  ' if e.is_dir() else '[file] '}{e.name}")
+            except PermissionError:
+                return "Permission denied"
+            rel = str(target.relative_to(root_path)) or "."
+            return f"{rel}/\n" + "\n".join(entries[:80])
+
+        @lc_tool
+        def read_file(path: str, start_line: int = 1, end_line: int = 80) -> str:
+            """Read a source file from the repository, with an optional line range."""
+            target = _safe(path)
+            if not target or not target.is_file():
+                return f"File not found: {path}"
+            try:
+                text = target.read_text(errors="replace")
+                lines = text.splitlines()
+                sl = max(0, start_line - 1)
+                el = min(len(lines), end_line)
+                excerpt = "\n".join(
+                    f"{sl + i + 1:4}: {line}" for i, line in enumerate(lines[sl:el])
+                )
+                rel = str(target.relative_to(root_path))
+                # Store full content for the plan prompt
+                read_files[rel] = text[:max_chars_per_file * 2]
+                return f"### {rel} (lines {sl+1}–{el} of {len(lines)})\n```\n{excerpt}\n```"
+            except Exception as e:
+                return f"Error reading {path}: {e}"
+
+        @lc_tool
+        def search_code(pattern: str, extension: str = "") -> str:
+            """Grep the codebase for a pattern. extension: file extension without dot, e.g. 'py' or 'ts'."""
+            exts = [f"*.{extension}"] if extension else ["*.py", "*.ts", "*.tsx", "*.js", "*.jsx"]
+            include_flags = [f"--include={e}" for e in exts]
+            cmd = ["grep", "-rn", "-i"] + include_flags + [pattern, str(root_path)]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+                lines = [
+                    ln for ln in result.stdout.splitlines()
+                    if not any(sd in ln for sd in skip_dirs)
+                ][:25]
+                if not lines:
+                    return f"No matches for '{pattern}'"
+                out: list[str] = []
+                for ln in lines:
+                    parts = ln.split(":", 1)
+                    if parts:
+                        try:
+                            rel = str(Path(parts[0]).resolve().relative_to(root_path))
+                            out.append(rel + (":" + parts[1] if len(parts) > 1 else ""))
+                        except ValueError:
+                            out.append(ln)
+                return "\n".join(out)
+            except Exception as e:
+                return f"Search error: {e}"
+
+        @lc_tool
+        def find_files(name_pattern: str) -> str:
+            """Find files whose name contains name_pattern (e.g. 'auth', 'config', 'renderer.ts')."""
+            glob = name_pattern if "*" in name_pattern else f"*{name_pattern}*"
+            matches: list[str] = []
+            for f in root_path.rglob(glob):
+                if f.is_file() and not any(sd in f.parts for sd in skip_dirs):
+                    try:
+                        matches.append(str(f.relative_to(root_path)))
+                    except ValueError:
+                        pass
+            if not matches:
+                return f"No files matching '{name_pattern}'"
+            return "\n".join(sorted(matches)[:30])
+
+        # ── navigation loop ────────────────────────────────────────────────
+        tools = [list_directory, read_file, search_code, find_files]
+        tool_map = {t.name: t for t in tools}
+
+        try:
+            llm_with_tools = self.llm.bind_tools(tools)
+        except Exception as e:
+            logger.warning(f"Planner: bind_tools failed ({e}) — falling back to keyword scoring")
+            return self._read_relevant_files(
+                root, issue_hint=f"{issue_title} {issue_body[:200]}"
+            )
+
+        from langchain_core.messages import SystemMessage as SM, HumanMessage as HM
+
+        issue_hint = self._sanitize_body_for_waf(issue_body, max_chars=600)
+        messages: list = [
+            SM(content=_NAVIGATION_SYSTEM_PROMPT),
+            HM(content=(
+                f"Repository: {root_path.name}/\n\n"
+                f"Issue title: {issue_title}\n"
+                f"Issue description:\n{issue_hint}\n\n"
+                "Navigate the repository to find the 2–4 most relevant source files."
+            )),
+        ]
+
+        for step in range(max_steps):
+            try:
+                response = llm_with_tools.invoke(messages)
+            except Exception as e:
+                logger.warning(f"Planner nav step {step} error: {e}")
+                break
+
+            messages.append(response)
+            tool_calls = getattr(response, "tool_calls", None) or []
+
+            if not tool_calls:
+                logger.info(
+                    "Planner navigator finished in %d step(s), %d file(s) read",
+                    step + 1, len(read_files),
+                )
+                break
+
+            for tc in tool_calls:
+                fn = tool_map.get(tc["name"])
+                try:
+                    result = fn.invoke(tc["args"]) if fn else f"Unknown tool: {tc['name']}"
+                except Exception as e:
+                    result = f"Tool error: {e}"
+                messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+
+        # ── format output ──────────────────────────────────────────────────
+        if not read_files:
+            logger.info("Agentic localize: no files read — falling back to keyword scoring")
+            return self._read_relevant_files(
+                root, issue_hint=f"{issue_title} {issue_body[:200]}"
+            )
+
+        chunks: list[str] = []
+        for rel, content in list(read_files.items())[:5]:
+            if len(content) > max_chars_per_file:
+                content = content[:max_chars_per_file] + "\n... (truncated)"
+            chunks.append(f"### {rel}\n```\n{content}\n```")
+
+        logger.info("Planner agentic localize: returning %d file(s)", len(chunks))
+        return "<!-- Found via agentic navigation -->\n\n" + "\n\n".join(chunks)
 
     def _grep_for_keywords(self, root: str, keywords: list[str]) -> dict[str, int]:
         """Return {relative_path: keyword_hit_count} by grepping the repo.

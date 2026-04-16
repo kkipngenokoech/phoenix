@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import threading
 from dataclasses import asdict, dataclass
@@ -20,8 +21,21 @@ Status = Literal["pending", "in_progress", "succeeded", "failed", "timeout", "sk
 
 # SSE endpoint on the Phoenix server (same machine)
 PHOENIX_SSE_URL = "http://localhost:8000/eval/stream"
-MAX_WAIT = 60 * 30       # 30 minutes max wait per issue
 FALLBACK_POLL_INTERVAL = 300  # 5-minute safety-net poll (only if SSE breaks)
+
+
+def sw_eval_max_wait_seconds() -> int:
+    """Per-issue wait for Phoenix (SSE + label poll). Override with SWEBENCH_MAX_WAIT (seconds)."""
+    raw = os.getenv("SWEBENCH_MAX_WAIT", str(60 * 45))
+    try:
+        v = int(raw)
+        return max(120, min(v, 6 * 3600))
+    except ValueError:
+        return 60 * 45
+
+
+# Default cap for eval runs (SWE-bench and run_eval); heavy repos may need 3600+.
+MAX_WAIT = sw_eval_max_wait_seconds()
 
 
 @dataclass
@@ -136,7 +150,8 @@ class EvalSSEListener:
                     self.sse_url,
                     headers={"Accept": "text/event-stream", "Cache-Control": "no-cache"},
                 )
-                with urllib.request.urlopen(req, timeout=MAX_WAIT + 60) as resp:
+                stream_timeout = sw_eval_max_wait_seconds() + 120
+                with urllib.request.urlopen(req, timeout=stream_timeout) as resp:
                     backoff = 2  # reset on successful connect
                     for raw_line in resp:
                         if self._stop.is_set():

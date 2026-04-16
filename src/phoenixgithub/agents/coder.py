@@ -25,15 +25,28 @@ For each step, respond with valid JSON matching this schema:
     "changes": [
         {
             "file_path": "relative/path/to/file.py",
-            "action": "modify" | "create",
-            "content": "the complete new file content"
+            "action": "modify" | "create" | "patch",
+            "content": "the complete new file content"   // for modify/create
+            // OR for patch (preferred for large existing files):
+            "search": "exact original lines to replace",
+            "replace": "new lines to substitute"
         }
     ],
     "commit_message": "feat: concise description of what changed"
 }
 
 Rules:
-- Write the COMPLETE file content for each changed file — no placeholders or ellipsis.
+- CRITICAL: Your changes MUST target the files listed in the plan's `files_to_modify`.
+  These files are shown in full under "Current File Contents" — read them carefully and
+  apply surgical edits to fix the issue. Do NOT ignore these files.
+- CRITICAL: Do NOT produce generic boilerplate files (database.py, models.py, config.py,
+  utils.py, core/*, etc.) unless they are explicitly listed in the plan. If your output
+  contains files unrelated to the plan, you have hallucinated — start over.
+- For LARGE existing files (shown as truncated or > ~200 lines): use action "patch" with
+  "search" (unique existing lines to replace) and "replace" (the new lines). This avoids
+  reproducing the entire file.
+- For small files or new files: use "modify" or "create" with "content" (complete file content).
+- Write COMPLETE content for modify/create — no placeholders or ellipsis.
 - Follow existing code style and conventions.
 - Add appropriate imports.
 - Do NOT add unnecessary comments explaining the change.
@@ -121,16 +134,25 @@ Rules:
         result = self._parse_coder_json(raw)
         if result is None:
             logger.warning("Coder returned invalid JSON — requesting one repair pass")
+            files_to_modify = plan.get("files_to_modify", [])
+            files_hint = (
+                f"\nCRITICAL: You must ONLY output changes for these files: {files_to_modify}\n"
+                f"Do NOT create generic placeholder files (main.py, database.py, models.py, etc.).\n"
+            ) if files_to_modify else ""
             repair_prompt = (
                 "Your previous response was not valid JSON.\n"
                 "Rules:\n"
                 "1. Respond ONLY with a JSON object — no markdown, no prose.\n"
-                "2. Keep EACH file's 'content' under 6000 characters. "
-                "If a file is larger, split it into logical sections and output only the "
-                "changed section with a comment marking the edit location.\n"
+                "2. For large files use action 'patch' with 'search'/'replace' instead of "
+                "full 'content' — this keeps the response small and valid.\n"
+                f"{files_hint}"
                 "3. Use this exact schema:\n"
                 "{\n"
-                '  "changes": [{"file_path": "relative/path.py", "action": "modify|create", "content": "..." }],\n'
+                '  "changes": [\n'
+                '    {"file_path": "path.py", "action": "patch", "search": "old lines", "replace": "new lines"}\n'
+                '    // OR for small/new files:\n'
+                '    {"file_path": "path.py", "action": "modify|create", "content": "complete content"}\n'
+                "  ],\n"
                 '  "commit_message": "feat: concise description"\n'
                 "}\n\n"
                 "Produce the corrected JSON now:"
@@ -170,8 +192,12 @@ Rules:
 
         for change in changes:
             file_path = change.get("file_path", "")
+            action = change.get("action", "modify")
             content = change.get("content", "")
-            if not file_path or not content:
+
+            if not file_path:
+                continue
+            if action != "patch" and not content:
                 continue
 
             full_path = (repo_root / file_path).resolve()
@@ -195,9 +221,44 @@ Rules:
                 created_dirs.add(d)
 
             full_path.parent.mkdir(parents=True, exist_ok=True)
-            full_path.write_text(content)
-            applied.append(file_path)
-            logger.info(f"Wrote: {file_path} ({len(content)} chars)")
+
+            if action == "patch":
+                search = change.get("search", "")
+                replace = change.get("replace", "")
+                if not search:
+                    logger.warning(f"Patch action missing 'search' field for {file_path} — skipping")
+                    continue
+                if full_path.exists():
+                    original = full_path.read_text(errors="replace")
+                    if search in original:
+                        patched = original.replace(search, replace, 1)
+                        full_path.write_text(patched)
+                        applied.append(file_path)
+                        logger.info(f"Patched: {file_path} ({len(search)} → {len(replace)} chars)")
+                    else:
+                        # Fuzzy fallback: normalize trailing whitespace per line
+                        def _norm(s: str) -> str:
+                            return "\n".join(line.rstrip() for line in s.splitlines())
+
+                        norm_orig = _norm(original)
+                        norm_search = _norm(search)
+                        norm_replace = _norm(replace)
+                        if norm_search in norm_orig:
+                            idx = norm_orig.index(norm_search)
+                            # Map index back to original (character offset may differ slightly)
+                            # Rebuild by replacing the normalized block
+                            patched = norm_orig.replace(norm_search, norm_replace, 1)
+                            full_path.write_text(patched)
+                            applied.append(file_path)
+                            logger.info(f"Patched (fuzzy): {file_path} ({len(search)} → {len(replace)} chars)")
+                        else:
+                            logger.warning(f"Patch search string not found in {file_path} — skipping")
+                else:
+                    logger.warning(f"Patch target does not exist: {file_path} — skipping")
+            else:
+                full_path.write_text(content)
+                applied.append(file_path)
+                logger.info(f"Wrote: {file_path} ({len(content)} chars)")
 
         # README guardrail: only enforce when the coder creates a genuinely NEW
         # top-level folder (depth == 1 AND it didn't exist before our writes).
@@ -261,13 +322,42 @@ Rules:
                 continue
         return None
 
+    # Show primary file up to this many chars. With the patch action, the coder
+    # outputs only the changed section (~1-3k chars), so we can afford to show
+    # more context. If the fix is deep in the file, truncation causes the coder
+    # to write search strings for code it hasn't seen (from training memory).
+    _PRIMARY_FILE_LIMIT = 20000
+
     def _read_files_for_plan(self, clone_path: str, plan: dict) -> str:
-        """Read files referenced in the plan so the coder has full context."""
-        files_to_read = plan.get("files_to_modify", []) + plan.get("files_to_create", [])
+        """Read files referenced in the plan so the coder has targeted context."""
+        modify_files = plan.get("files_to_modify", [])
+        create_files = plan.get("files_to_create", [])
         root = Path(clone_path)
         chunks: list[str] = []
 
-        for rel_path in files_to_read:
+        # Show the primary modify target in full (up to limit); rest as name-only
+        for i, rel_path in enumerate(modify_files):
+            full = root / rel_path
+            if full.exists():
+                try:
+                    content = full.read_text(errors="replace")
+                    if i == 0:
+                        # Primary target — show content up to limit
+                        if len(content) > self._PRIMARY_FILE_LIMIT:
+                            content = content[: self._PRIMARY_FILE_LIMIT] + f"\n... ({len(content)} chars total)"
+                        chunks.append(f"### {rel_path} (existing)\n```\n{content}\n```")
+                    else:
+                        # Secondary targets — name + size hint only to avoid token explosion
+                        chunks.append(
+                            f"### {rel_path} (existing, {len(content)} chars — "
+                            f"secondary target; modify only if the plan explicitly requires it)"
+                        )
+                except Exception:
+                    chunks.append(f"### {rel_path}\n(could not read)")
+            else:
+                chunks.append(f"### {rel_path}\n(new file — does not exist yet)")
+
+        for rel_path in create_files:
             full = root / rel_path
             if full.exists():
                 try:

@@ -27,6 +27,7 @@ class StepStatus(str, Enum):
 
 class StepID(str, Enum):
     PLAN = "plan"
+    REPRODUCE = "reproduce"
     IMPLEMENT = "implement"
     TEST = "test"
     PR = "pr"
@@ -53,6 +54,7 @@ class Run(BaseModel):
 
     steps: dict[str, StepState] = Field(default_factory=lambda: {
         StepID.PLAN: StepState(),
+        StepID.REPRODUCE: StepState(),
         StepID.IMPLEMENT: StepState(),
         StepID.TEST: StepState(),
         StepID.PR: StepState(),

@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 load_dotenv()
 
@@ -86,6 +86,25 @@ class AgentConfig(BaseModel):
         default_factory=lambda: os.getenv("ALLOW_NO_TESTS", "false").lower() in {"1", "true", "yes"}
     )
     validation_profile: str = Field(default_factory=lambda: os.getenv("VALIDATION_PROFILE", "auto"))
+    use_reproducer: bool = Field(
+        default_factory=lambda: os.getenv("USE_REPRODUCER", "true").lower() in {"1", "true", "yes"}
+    )
+    # How Phoenix decides the issue is "resolved" after the test step (PR still requires tests
+    # unless reproducer-only mode is intentionally strict).
+    #   tests      — project test suite verdict only (default; matches typical GitHub review).
+    #   reproducer — only the synthetic reproducer test passing counts (strict R→F→V).
+    #   both       — suite must pass AND reproducer must not still fail when one was written.
+    resolution_mode: str = Field(
+        default_factory=lambda: os.getenv("RESOLUTION_MODE", "tests").strip().lower()
+    )
+
+    @field_validator("resolution_mode", mode="before")
+    @classmethod
+    def _validate_resolution_mode(cls, v: object) -> str:
+        s = (str(v) if v is not None else "tests").strip().lower()
+        if s in {"tests", "reproducer", "both"}:
+            return s
+        return "tests"
 
 
 class Config(BaseModel):

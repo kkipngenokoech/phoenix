@@ -19,6 +19,35 @@ from phoenixgithub.agents.base import BaseAgent
 logger = logging.getLogger(__name__)
 ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 
+_VALID_RESOLUTION_MODES = frozenset({"tests", "reproducer", "both"})
+
+
+def compute_issue_resolved(
+    mode: str,
+    *,
+    test_passed: bool,
+    reproducer_passed: bool | None,
+) -> bool:
+    """Whether Phoenix should treat the issue as resolved for the test step gate.
+
+    ``reproducer_passed``: True/False/None — None means no reproducer test was available.
+    """
+    m = (mode or "tests").strip().lower()
+    if m not in _VALID_RESOLUTION_MODES:
+        m = "tests"
+    if m == "tests":
+        return bool(test_passed)
+    if m == "reproducer":
+        if reproducer_passed is None:
+            return False
+        return bool(reproducer_passed)
+    # both
+    if not test_passed:
+        return False
+    if reproducer_passed is False:
+        return False
+    return True
+
 
 class TesterAgent(BaseAgent):
     role = "tester"
@@ -46,11 +75,16 @@ Respond ONLY with the JSON object, no markdown fences."""
         test_command: str = "pytest --import-mode=importlib --rootdir=.",
         allow_no_tests: bool = False,
         validation_profile: str = "auto",
+        resolution_mode: str = "tests",
     ) -> None:
         super().__init__(llm)
         self.test_command = test_command
         self.allow_no_tests = allow_no_tests
         self.validation_profile = validation_profile.lower().strip()
+        rm = (resolution_mode or "tests").strip().lower()
+        self.resolution_mode = rm if rm in _VALID_RESOLUTION_MODES else "tests"
+        if rm != self.resolution_mode:
+            logger.warning("Unknown RESOLUTION_MODE %r — using %r", resolution_mode, self.resolution_mode)
 
     def run(self, context: dict[str, Any]) -> dict[str, Any]:
         clone_path = context["clone_path"]
@@ -63,11 +97,18 @@ Respond ONLY with the JSON object, no markdown fences."""
 
         if self.allow_no_tests and self._is_no_tests_collected(test_output):
             logger.info("No tests collected (pytest exit 5) and ALLOW_NO_TESTS enabled — treating as pass")
+            reproducer_passed = self._check_reproducer(context, clone_path)
+            issue_resolved = compute_issue_resolved(
+                self.resolution_mode, test_passed=True, reproducer_passed=reproducer_passed
+            )
             return {
                 "test_passed": True,
                 "test_output": test_output,
                 "feedback": "",
                 "test_verdict": {"passed": True, "summary": "No tests collected; allowed by configuration."},
+                "reproducer_passed": reproducer_passed,
+                "issue_resolved": issue_resolved,
+                "resolved": issue_resolved,
             }
 
         stdout = test_output.get("stdout", "")
@@ -76,10 +117,17 @@ Respond ONLY with the JSON object, no markdown fences."""
         ) and test_output["exit_code"] == 0
         if test_output["exit_code"] == 0 and ("passed" in stdout or skipped_unavailable):
             logger.info("Tests passed (or tool unavailable — skipped) — skipping LLM analysis")
+            reproducer_passed = self._check_reproducer(context, clone_path)
+            issue_resolved = compute_issue_resolved(
+                self.resolution_mode, test_passed=True, reproducer_passed=reproducer_passed
+            )
             return {
                 "test_passed": True,
                 "test_output": test_output,
                 "feedback": "",
+                "reproducer_passed": reproducer_passed,
+                "issue_resolved": issue_resolved,
+                "resolved": issue_resolved,
             }
 
         # Tests failed — check if baseline (without Phoenix's changes) also fails.
@@ -92,6 +140,10 @@ Respond ONLY with the JSON object, no markdown fences."""
                     logger.info(
                         "Test failures pre-exist on baseline (no new failures from Phoenix) — treating as pass"
                     )
+                    reproducer_passed = self._check_reproducer(context, clone_path)
+                    issue_resolved = compute_issue_resolved(
+                        self.resolution_mode, test_passed=True, reproducer_passed=reproducer_passed
+                    )
                     return {
                         "test_passed": True,
                         "test_output": test_output,
@@ -100,6 +152,9 @@ Respond ONLY with the JSON object, no markdown fences."""
                             "passed": True,
                             "summary": "Baseline test suite was already failing; Phoenix introduced no new failures.",
                         },
+                        "reproducer_passed": reproducer_passed,
+                        "issue_resolved": issue_resolved,
+                        "resolved": issue_resolved,
                     }
                 else:
                     logger.warning(
@@ -147,12 +202,60 @@ Respond ONLY with the JSON object, no markdown fences."""
                 "feedback": raw[:1000],
             }
 
+        # Check reproducer test if one was written
+        reproducer_passed = self._check_reproducer(context, clone_path)
+        test_passed = bool(verdict.get("passed", False))
+        issue_resolved = compute_issue_resolved(
+            self.resolution_mode, test_passed=test_passed, reproducer_passed=reproducer_passed
+        )
+
         return {
-            "test_passed": verdict.get("passed", False),
+            "test_passed": test_passed,
             "test_output": test_output,
             "test_verdict": verdict,
             "feedback": verdict.get("feedback", ""),
+            "reproducer_passed": reproducer_passed,
+            "issue_resolved": issue_resolved,
+            "resolved": issue_resolved,
         }
+
+    def _check_reproducer(self, context: dict[str, Any], clone_path: str) -> bool | None:
+        """Run the reproducer test if one was written. Returns True if it now passes.
+
+        None = no reproducer test available (skipped or not reproduced).
+        True = reproducer test passes → issue is resolved.
+        False = reproducer test still fails → issue not yet fixed.
+        """
+        reproducer_file = context.get("reproducer_file")
+        reproduced = context.get("reproduced", False)
+
+        if not reproducer_file or not reproduced:
+            return None
+
+        abs_path = Path(clone_path) / reproducer_file
+        if not abs_path.exists():
+            logger.warning(f"Reproducer test file missing: {reproducer_file}")
+            return None
+
+        try:
+            result = subprocess.run(
+                ["python", "-m", "pytest", reproducer_file, "-x", "--tb=short", "-q", "--no-header"],
+                cwd=clone_path,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            passed = result.returncode == 0
+            logger.info(
+                "Reproducer test %s: %s (exit %d)",
+                reproducer_file,
+                "PASSED ✓ — issue resolved" if passed else "FAILED — issue not yet fixed",
+                result.returncode,
+            )
+            return passed
+        except Exception as e:
+            logger.warning(f"Could not run reproducer test: {e}")
+            return None
 
     def _install_deps(self, cwd: str) -> None:
         """Best-effort dependency installation before tests run."""
