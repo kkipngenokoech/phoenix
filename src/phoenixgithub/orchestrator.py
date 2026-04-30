@@ -9,7 +9,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import subprocess
 import threading
+from pathlib import Path
 from typing import Any
 
 from phoenixgithub.agents.coder import CoderAgent
@@ -20,7 +22,7 @@ from phoenixgithub.agents.reproducer import ReproducerAgent
 from phoenixgithub.agents.tester import TesterAgent
 from phoenixgithub.config import Config
 from phoenixgithub.github_client import GitHubClient
-from phoenixgithub.models import Run, RunStatus, StepID
+from phoenixgithub.models import Run, RunContext, RunStatus, StepID
 from phoenixgithub.provider import create_llm
 from phoenixgithub.state import StateManager
 
@@ -42,34 +44,51 @@ class Orchestrator:
         self.github = github
         self.webhook_mode = webhook_mode
         self.state = state
-        # Single local clone/worktree per repo means runs must execute serially
-        # to avoid git checkout/reset collisions across threads.
-        self._execute_lock = threading.Lock()
+        # One lock per repo: different repos run in parallel; same repo serializes
+        # because a single local clone can't handle concurrent branch/reset ops.
+        self._repo_locks: dict[str, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
 
         llm = create_llm(config.llm)
-        self.planner = PlannerAgent(llm)
-        self.reproducer = ReproducerAgent(llm)
-        self.coder = CoderAgent(llm)
+        provider = config.llm.provider
+        self.planner = PlannerAgent(llm, provider)
+        self.reproducer = ReproducerAgent(llm, provider)
+        self.coder = CoderAgent(llm, provider)
         self.tester = TesterAgent(
             llm,
+            provider,
             test_command=config.agent.test_command,
             allow_no_tests=config.agent.allow_no_tests,
             validation_profile=config.agent.validation_profile,
             resolution_mode=config.agent.resolution_mode,
         )
-        self.pr_agent = PRAgent(llm)
-        self.failure_analyst = FailureAnalystAgent(llm)
+        self.pr_agent = PRAgent(llm, provider)
+        self.failure_analyst = FailureAnalystAgent(llm, provider)
+
+    def _get_repo_lock(self, repo: str) -> threading.Lock:
+        """Return the per-repo execution lock, creating it if needed.
+
+        Each repo gets its own lock because execution requires an exclusive
+        local clone. Different repos can run fully in parallel.
+        """
+        with self._locks_guard:
+            if repo not in self._repo_locks:
+                self._repo_locks[repo] = threading.Lock()
+            return self._repo_locks[repo]
 
     def execute(self, run: Run) -> Run:
         """Execute the full pipeline for a run. Returns updated run."""
-        with self._execute_lock:
+        from phoenixgithub.agents.usage import reset_usage
+        reset_usage()  # zero out token/time accumulator for this run's thread
+
+        with self._get_repo_lock(run.repo):
             run.status = RunStatus.RUNNING
             self.state.save_run(run)
 
             issue_number = run.issues[0]
             issue = self.github.get_issue(issue_number)
 
-            context: dict[str, Any] = {
+            context: RunContext = {
                 "run_id": run.run_id,
                 "repo": run.repo,
                 "issue_number": issue_number,
@@ -136,6 +155,7 @@ class Orchestrator:
 
                 # 6. Success
                 run.status = RunStatus.SUCCEEDED
+                run.flush_llm_usage()
                 self.state.save_run(run)
                 self.state.mark_run_finished(run.run_id)
 
@@ -159,6 +179,7 @@ class Orchestrator:
                 logger.error(f"Run {run.run_id} failed: {e}", exc_info=True)
                 run.status = RunStatus.FAILED
                 run.error = str(e)
+                run.flush_llm_usage()
                 self.state.save_run(run)
                 self._write_run_log(run, context, error=e)
                 return self._finalize_failure(run, issue_number, context)
@@ -167,7 +188,7 @@ class Orchestrator:
     # Steps
     # ------------------------------------------------------------------
 
-    def _step_plan(self, run: Run, context: dict) -> Run:
+    def _step_plan(self, run: Run, context: RunContext) -> Run:
         logger.info(f"[{run.run_id}] PLAN — analyzing issue #{context['issue_number']}")
         run.set_step_running(StepID.PLAN)
         self.state.save_run(run)
@@ -242,7 +263,7 @@ class Orchestrator:
         self.state.save_run(run)
         return run
 
-    def _read_plan_files_for_reproducer(self, context: dict[str, Any]) -> str:
+    def _read_plan_files_for_reproducer(self, context: RunContext) -> str:
         """Load source excerpts for files in the plan — planner never returns `relevant_code`."""
         from pathlib import Path
 
@@ -277,7 +298,7 @@ class Orchestrator:
 
         return "\n\n".join(chunks)
 
-    def _step_reproduce(self, run: Run, context: dict) -> Run:
+    def _step_reproduce(self, run: Run, context: RunContext) -> Run:
         """Write and verify a failing reproduction test (non-blocking step).
 
         On success: adds reproducer_test, reproducer_file, reproduced=True to context.
@@ -330,7 +351,7 @@ class Orchestrator:
         self.state.save_run(run)
         return run  # always continue — reproducer failure is non-blocking
 
-    def _step_implement_and_test(self, run: Run, context: dict) -> Run:
+    def _step_implement_and_test(self, run: Run, context: RunContext) -> Run:
         """Implement + test with verify-reject-retry loop."""
         max_retries = self.config.agent.max_retries
         all_applied_files: set[str] = set()
@@ -347,13 +368,15 @@ class Orchestrator:
 
                 # Detect hallucinated output: coder ignored plan's files_to_modify
                 # and produced unrelated generic files (database.py, models.py, etc.)
+                # Skip this guard for AgenticCoderAgent — it navigates the repo itself
+                # and may correctly identify a different file than the planner guessed.
                 from pathlib import Path as _Path
                 clone_path = context.get("clone_path", "")
                 plan_files = set(context.get("plan", {}).get("files_to_modify", []))
                 applied = coder_outputs.get("applied_files", [])
                 changes = coder_outputs.get("changes", [])
 
-                if plan_files and clone_path:
+                if plan_files and clone_path and not coder_outputs.get("agentic"):
                     # plan_all = files the coder is allowed to touch
                     plan_all = plan_files | set(context.get("plan", {}).get("files_to_create", []))
                     # Check if coder ignored the plan entirely (no overlap at all)
@@ -415,6 +438,54 @@ class Orchestrator:
                     self.state.save_run(run)
                     return run
 
+                # ── Safety guards: run after scope check, before test ─────────
+                from phoenixgithub.safety import run_all_guards
+                guard_errors, guard_warnings = run_all_guards(
+                    coder_outputs.get("changes", []),
+                    clone_path=context.get("clone_path", ""),
+                )
+                if guard_warnings:
+                    for w in guard_warnings:
+                        logger.warning("[%s] Safety warning: %s", run.run_id, w.message)
+                    # Attach warnings to context so PR Agent can surface them
+                    context["safety_warnings"] = [w.feedback() for w in guard_warnings]
+                if guard_errors and attempt < max_retries:
+                    feedback_lines = ["Your changes were blocked by safety guards:"]
+                    for e in guard_errors:
+                        feedback_lines.append(e.feedback())
+                    context["verify_feedback"] = "\n\n".join(feedback_lines)
+                    logger.warning(
+                        "[%s] Safety guard(s) blocked attempt %d: %s",
+                        run.run_id, attempt, [e.guard for e in guard_errors],
+                    )
+                    # Revert disk state so the next Coder attempt starts clean
+                    self._revert_coder_changes(
+                        clone_path=context.get("clone_path", ""),
+                        changes=coder_outputs.get("changes", []),
+                    )
+                    run.step(StepID.IMPLEMENT).retries += 1
+                    continue
+                # ─────────────────────────────────────────────────────────────
+
+                # ── Syntax check: fast-fail before test run (~2s vs 60s+) ──────
+                syntax_errors = self._syntax_check_changes(
+                    coder_outputs.get("changes", []),
+                    context.get("clone_path", ""),
+                )
+                if syntax_errors and attempt < max_retries:
+                    err_text = "\n".join(syntax_errors)
+                    context["verify_feedback"] = (
+                        f"Your changes contain Python syntax errors — fix them before anything else:\n{err_text}"
+                    )
+                    logger.warning("[%s] Syntax errors on attempt %d:\n%s", run.run_id, attempt, err_text)
+                    self._revert_coder_changes(
+                        clone_path=context.get("clone_path", ""),
+                        changes=coder_outputs.get("changes", []),
+                    )
+                    run.step(StepID.IMPLEMENT).retries += 1
+                    continue
+                # ─────────────────────────────────────────────────────────────
+
                 run.set_step_done(StepID.IMPLEMENT, {
                     "applied_files": context.get("applied_files", []),
                     "attempt": attempt,
@@ -453,6 +524,10 @@ class Orchestrator:
                 if auto_guidance:
                     context["auto_guidance"] = auto_guidance
                     logger.info(f"[{run.run_id}] Auto guidance: {auto_guidance[:180]}")
+                # Capture diff of what coder changed so it can see its own attempt on retry
+                diff = self._get_git_diff(context.get("clone_path", ""))
+                if diff:
+                    context["current_diff"] = diff
                 logger.warning(f"[{run.run_id}] Tests failed (attempt {attempt}): {feedback[:200]}")
                 run.step(StepID.TEST).retries += 1
 
@@ -470,7 +545,92 @@ class Orchestrator:
         self.state.save_run(run)
         return run
 
-    def _derive_auto_guidance(self, test_output: dict[str, Any], feedback: str) -> str:
+    def _syntax_check_changes(self, changes: list[dict], clone_path: str) -> list[str]:
+        """Run py_compile on each modified .py file. Returns list of error strings."""
+        errors: list[str] = []
+        root = Path(clone_path)
+        for ch in changes:
+            fp = ch.get("file_path", "")
+            if not fp.endswith(".py") or ch.get("action") not in ("modify", "create", "patch", None):
+                continue
+            full = root / fp
+            if not full.exists():
+                continue
+            try:
+                r = subprocess.run(
+                    ["python", "-m", "py_compile", str(full)],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if r.returncode != 0:
+                    errors.append(f"{fp}: {(r.stderr or r.stdout).strip()[:200]}")
+            except Exception as e:
+                errors.append(f"{fp}: py_compile error: {e}")
+        return errors
+
+    def _get_git_diff(self, clone_path: str, max_chars: int = 2000) -> str:
+        """Return `git diff HEAD` output (unstaged changes vs last commit)."""
+        if not clone_path:
+            return ""
+        try:
+            r = subprocess.run(
+                ["git", "diff", "HEAD"],
+                cwd=clone_path, capture_output=True, text=True, timeout=15,
+            )
+            diff = r.stdout
+            if len(diff) > max_chars:
+                diff = diff[:max_chars] + "\n... (diff truncated)"
+            return diff.strip()
+        except Exception:
+            return ""
+
+    def _revert_coder_changes(self, clone_path: str, changes: list[dict]) -> None:
+        """Restore the git working tree to HEAD state after a blocked Coder attempt.
+
+        Restores tracked files modified by the Coder and deletes any newly created
+        files (untracked). This ensures the next retry starts from a clean slate
+        rather than building on top of rejected changes.
+        """
+        if not clone_path:
+            return
+        root = Path(clone_path)
+        if not (root / ".git").exists():
+            return
+
+        try:
+            # Restore all tracked files modified by this Coder run
+            tracked_paths = [
+                c["file_path"] for c in changes
+                if c.get("file_path") and c.get("action") in ("modify", "patch", None)
+            ]
+            if tracked_paths:
+                subprocess.run(
+                    ["git", "checkout", "HEAD", "--"] + tracked_paths,
+                    cwd=clone_path,
+                    capture_output=True,
+                    timeout=30,
+                )
+
+            # Delete untracked files created by this Coder run
+            created_paths = [
+                c["file_path"] for c in changes
+                if c.get("file_path") and c.get("action") == "create"
+            ]
+            for fp in created_paths:
+                target = root / fp
+                if target.exists() and target.is_file():
+                    try:
+                        target.unlink()
+                    except Exception:
+                        pass
+
+            logger.info(
+                "[revert] Restored %d tracked file(s), deleted %d created file(s) after guard block",
+                len(tracked_paths), len(created_paths),
+            )
+        except Exception as e:
+            logger.warning("[revert] Failed to revert coder changes: %s", e)
+
+    def _derive_auto_guidance(self, test_output: dict[str, Any], feedback: str) -> str:  # noqa: ARG002
         """Generate deterministic retry guidance from concrete failure patterns."""
         stdout = (test_output.get("stdout") or "")
         stderr = (test_output.get("stderr") or "")
@@ -533,7 +693,7 @@ class Orchestrator:
         # Keep most recent guidance concise.
         return "\n".join(directives[-5:])
 
-    def _step_pr(self, run: Run, context: dict) -> Run:
+    def _step_pr(self, run: Run, context: RunContext) -> Run:
         logger.info(f"[{run.run_id}] PR — creating pull request")
         run.set_step_running(StepID.PR)
         self.state.save_run(run)
@@ -565,12 +725,12 @@ class Orchestrator:
     # Failure handling
     # ------------------------------------------------------------------
 
-    def _write_run_log(self, run: Run, context: dict, error: Exception | None = None) -> None:
-        """Write a per-run failure log to eval/results/run_logs/ for offline analysis."""
+    def _write_run_log(self, run: Run, context: RunContext, error: Exception | None = None) -> None:
+        """Write a per-run failure log to <workspace>/run_logs/ for offline analysis."""
         import datetime
         from pathlib import Path
 
-        log_dir = Path("eval/results/run_logs")
+        log_dir = Path(self.config.workspace_dir) / "run_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{run.run_id}.md"
 
@@ -608,7 +768,7 @@ class Orchestrator:
         log_path.write_text("\n".join(lines))
         logger.info(f"Run log written: {log_path}")
 
-    def _finalize_failure(self, run: Run, issue_number: int, context: dict[str, Any] | None = None) -> Run:
+    def _finalize_failure(self, run: Run, issue_number: int, context: RunContext | None = None) -> Run:
         self.state.mark_run_finished(run.run_id)
         context = context or {}
         test_feedback = (context.get("last_test_feedback") or "").strip()

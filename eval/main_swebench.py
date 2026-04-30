@@ -52,6 +52,13 @@ def main() -> None:
         help="Filter to specific repo names, e.g. requests pytest (default: all supported)",
     )
     parser.add_argument(
+        "--skip-repos",
+        nargs="*",
+        metavar="REPO",
+        default=[],
+        help="Exclude repo names, e.g. astropy matplotlib scikit-learn",
+    )
+    parser.add_argument(
         "--workspace",
         default=os.getenv("EVAL_WORKSPACE", "/tmp/phoenix-swebench"),
         help="Local directory for cloned repos",
@@ -84,6 +91,25 @@ def main() -> None:
         default=None,
         metavar="SEC",
         help="Max seconds to wait per issue for Phoenix (overrides SWEBENCH_MAX_WAIT env; clamped 120–21600)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Number of parallel Phoenix workers (default: 1). Each worker uses its own clone workspace.",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Disable resume mode — re-run all instances even if output file exists.",
+    )
+    parser.add_argument(
+        "--max-total",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Cap total instances to run (useful for staged rollouts, e.g. --max-total 50).",
     )
     args = parser.parse_args()
 
@@ -120,6 +146,18 @@ def main() -> None:
         max_per_repo=args.max,
     )
 
+    if args.skip_repos:
+        skip_full: set[str] = set()
+        for name in args.skip_repos:
+            if "/" in name:
+                skip_full.add(name)
+            else:
+                matched = [r for r in SUPPORTED_REPOS if r.split("/")[1] == name]
+                skip_full.update(matched)
+        before = len(instances)
+        instances = [i for i in instances if i.repo not in skip_full]
+        logger.info("Skipped %d instance(s) from: %s", before - len(instances), sorted(skip_full))
+
     if args.only:
         allow = set(args.only)
         instances = [i for i in instances if i.instance_id in allow]
@@ -127,6 +165,10 @@ def main() -> None:
             logger.error("No instances match --only %s (check instance_id spelling)", allow)
             sys.exit(1)
         logger.info("Filtered to %d instance(s) via --only", len(instances))
+
+    if args.max_total and len(instances) > args.max_total:
+        instances = instances[: args.max_total]
+        logger.info("Capped to %d instance(s) via --max-total", len(instances))
 
     if not instances:
         logger.error("No instances loaded — check repo names and tier")
@@ -151,6 +193,8 @@ def main() -> None:
         output_file=args.output,
         sse_url=args.sse_url,
         max_wait=args.max_wait,
+        workers=args.workers,
+        resume=not args.no_resume,
     )
 
     resolved = sum(1 for r in results if r.resolved_oracle is True)

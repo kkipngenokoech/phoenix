@@ -105,6 +105,69 @@ def create_webhook_app(
             },
         )
 
+    @app.post("/eval/trigger")
+    async def eval_trigger(request: Request) -> dict[str, Any]:
+        """Eval-only: directly dispatch a run for a fork repo issue via PAT auth.
+
+        Fork repos don't have the GitHub App installed, so no webhook fires when
+        ai:ready is applied.  The eval runner calls this endpoint instead.
+
+        Body: {"repo": "owner/fork", "issue_number": 42}
+        """
+        body = await request.json()
+        repo_full: str = body.get("repo", "")
+        issue_number: int | None = body.get("issue_number")
+        label_name: str = body.get("label", config.labels.ready)
+
+        if not repo_full or not issue_number:
+            raise HTTPException(status_code=400, detail="repo and issue_number required")
+
+        if state.is_dispatched(issue_number):
+            logger.info(f"Eval trigger: #{issue_number} already dispatched")
+            return {"status": "skipped", "reason": "already_dispatched"}
+
+        if state.watcher.active_runs >= config.github.max_concurrent_runs:
+            return {"status": "skipped", "reason": "concurrency_limit"}
+
+        # PAT-based client for the fork — no GitHub App installation needed
+        fork_config = config.model_copy(
+            update={"github": config.github.model_copy(update={"repo": repo_full})}
+        )
+        github_client = GitHubClient(fork_config)
+
+        run = Run(
+            repo=repo_full,
+            issues=[issue_number],
+            branch_name=f"phoenix/issue-{issue_number}",
+        )
+        run.context["trigger_label"] = label_name
+        run.context["eval_trigger"] = True
+
+        state.mark_dispatched(issue_number, run.run_id)
+        state.save_run(run)
+
+        try:
+            github_client.transition_label(issue_number, label_name, config.labels.in_progress)
+        except Exception as e:
+            logger.warning(f"Eval trigger: label transition failed for #{issue_number}: {e}")
+
+        def _dispatch_and_broadcast(r: Run, gh: GitHubClient) -> None:
+            on_dispatch(r, gh)
+            # Broadcast terminal event directly — fork has no GitHub App, so no
+            # webhook fires when Phoenix applies ai:done / ai:failed.
+            from phoenixgithub.models import RunStatus
+            ev_label = "ai:done" if r.status == RunStatus.SUCCEEDED else "ai:failed"
+            _broadcast_eval_event({"repo": r.repo, "issue_number": r.issues[0], "label": ev_label})
+
+        threading.Thread(
+            target=_dispatch_and_broadcast,
+            args=(run, github_client),
+            daemon=True,
+        ).start()
+
+        logger.info(f"Eval trigger: dispatched {run.run_id} for {repo_full}#{issue_number}")
+        return {"status": "dispatched", "run_id": run.run_id, "issue": issue_number, "repo": repo_full}
+
     @app.post("/webhook")
     async def handle_webhook(
         request: Request,

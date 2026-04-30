@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import os
+from enum import Enum
 from pathlib import Path
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
 
 load_dotenv()
+
+
+class LLMProvider(str, Enum):
+    ANTHROPIC = "anthropic"
+    OPENAI = "openai"
 
 
 class GitHubAppConfig(BaseModel):
@@ -58,7 +64,9 @@ class LabelConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    provider: str = Field(default_factory=lambda: os.getenv("LLM_PROVIDER", "anthropic"))
+    provider: LLMProvider = Field(
+        default_factory=lambda: LLMProvider(os.getenv("LLM_PROVIDER", "anthropic").lower())
+    )
     model: str = Field(default_factory=lambda: os.getenv("LLM_MODEL", "claude-sonnet-4-20250514"))
     api_key: str = Field(default_factory=lambda: os.getenv("LLM_API_KEY") or os.getenv("ANTHROPIC_API_KEY", ""))
     base_url: str | None = Field(default_factory=lambda: os.getenv("LLM_BASE_URL"))
@@ -67,7 +75,7 @@ class LLMConfig(BaseModel):
 
 
 class AgentConfig(BaseModel):
-    max_retries: int = 2
+    max_retries: int = Field(default_factory=lambda: int(os.getenv("MAX_RETRIES", "2")))
     test_command: str = Field(
         default_factory=lambda: os.getenv("TEST_COMMAND", "pytest --import-mode=importlib --rootdir=.")
     )

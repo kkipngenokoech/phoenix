@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 _REPRODUCER_SYSTEM_PROMPT = """You are a test engineer specializing in bug reproduction.
 
-Given a GitHub issue and the relevant source code, write a minimal pytest test that:
+Given a GitHub issue and the relevant source code, write a thorough pytest test that:
 1. Demonstrates the specific bug or missing behaviour described in the issue
 2. FAILS on the current (buggy) code
 3. Will PASS once the issue is correctly fixed
@@ -39,9 +39,12 @@ Given a GitHub issue and the relevant source code, write a minimal pytest test t
 Rules:
 - One test function named `test_issue_reproduction`
 - Import only from the existing package (no new external dependencies)
-- Keep it minimal — exercise the exact behaviour the issue describes
+- Be thorough: cover all behaviors described in the issue, including edge cases mentioned
+- Test the exact function, class, or method that is broken with the exact inputs from the issue
+- Write precise assertions that check the expected correct output — not just that no exception is raised
 - Do NOT mock the core logic under test
 - The file must be runnable with: pytest <file_path> -x
+- If the issue mentions a specific return value, error message, or data structure, assert it exactly
 
 Respond with valid JSON only (no markdown fences, no text before or after the object):
 {
@@ -261,10 +264,27 @@ class ReproducerAgent(BaseAgent):
                 ["pip", "install", "-e", ".", "--quiet", "--no-build-isolation"],
                 cwd=clone_path, capture_output=True, timeout=120,
             )
+            # pip install may clobber pytest (e.g. processing pytest-dev/pytest repo)
+            try:
+                ver = subprocess.run(
+                    ["python", "-m", "pytest", "--version"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if "dev" in ver.stdout.lower() or ver.returncode != 0:
+                    logger.warning(
+                        "pip install clobbered pytest (%s) — restoring stable version",
+                        ver.stdout.strip(),
+                    )
+                    subprocess.run(
+                        ["pip", "install", "--quiet", "--upgrade", "pytest"],
+                        capture_output=True, timeout=120,
+                    )
+            except Exception:
+                pass
 
         try:
             result = subprocess.run(
-                ["python", "-m", "pytest", test_file, "-x", "--tb=short", "-q", "--no-header"],
+                ["python", "-m", "pytest", test_file, "-x", "--tb=short", "-q"],
                 cwd=clone_path,
                 capture_output=True,
                 text=True,

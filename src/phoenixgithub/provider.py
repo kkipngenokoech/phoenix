@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from langchain_core.language_models import BaseChatModel
 
-from phoenixgithub.config import LLMConfig
+from phoenixgithub.config import LLMConfig, LLMProvider
 
 
 def create_llm(config: LLMConfig) -> BaseChatModel:
@@ -13,7 +13,7 @@ def create_llm(config: LLMConfig) -> BaseChatModel:
         "max_tokens": config.max_tokens,
     }
 
-    if config.provider == "anthropic":
+    if config.provider == LLMProvider.ANTHROPIC:
         from langchain_anthropic import ChatAnthropic
         return ChatAnthropic(
             model=config.model,
@@ -22,7 +22,7 @@ def create_llm(config: LLMConfig) -> BaseChatModel:
             **kwargs,
         )
 
-    if config.provider == "openai":
+    if config.provider == LLMProvider.OPENAI:
         from langchain_openai import ChatOpenAI
         return ChatOpenAI(
             model=config.model,

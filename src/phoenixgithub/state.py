@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -19,6 +20,7 @@ class StateManager:
     def __init__(self, state_file: str, workspace_dir: str) -> None:
         self._state_file = Path(state_file)
         self._workspace_dir = Path(workspace_dir)
+        self._lock = threading.Lock()
         self._watcher = self._load_watcher_state()
 
     # ------------------------------------------------------------------
@@ -32,8 +34,8 @@ class StateManager:
         return WatcherState()
 
     def save_watcher_state(self) -> None:
-        self._state_file.parent.mkdir(parents=True, exist_ok=True)
-        self._state_file.write_text(self._watcher.model_dump_json(indent=2))
+        with self._lock:
+            self._flush()
 
     @property
     def watcher(self) -> WatcherState:
@@ -43,25 +45,32 @@ class StateManager:
         return f"issue-{issue_number}" in self._watcher.dispatched
 
     def mark_dispatched(self, issue_number: int, run_id: str) -> None:
-        self._watcher.dispatched[f"issue-{issue_number}"] = run_id
-        self._watcher.active_runs += 1
-        self._watcher.last_poll = datetime.now(timezone.utc)
-        self.save_watcher_state()
+        with self._lock:
+            self._watcher.dispatched[f"issue-{issue_number}"] = run_id
+            self._watcher.active_runs += 1
+            self._watcher.last_poll = datetime.now(timezone.utc)
+            self._flush()
 
     def mark_run_finished(self, run_id: str) -> None:
         # Release any issue dispatch locks owned by this run so a relabel to
         # ai:ready can be picked up again in future polling cycles.
-        stale_keys = [k for k, v in self._watcher.dispatched.items() if v == run_id]
-        for key in stale_keys:
-            self._watcher.dispatched.pop(key, None)
-
-        self._watcher.active_runs = max(0, self._watcher.active_runs - 1)
-        self.save_watcher_state()
+        with self._lock:
+            stale_keys = [k for k, v in self._watcher.dispatched.items() if v == run_id]
+            for key in stale_keys:
+                self._watcher.dispatched.pop(key, None)
+            self._watcher.active_runs = max(0, self._watcher.active_runs - 1)
+            self._flush()
 
     def clear_dispatched(self, issue_number: int) -> None:
         """Allow an issue to be re-dispatched (e.g. after ai:revise)."""
-        self._watcher.dispatched.pop(f"issue-{issue_number}", None)
-        self.save_watcher_state()
+        with self._lock:
+            self._watcher.dispatched.pop(f"issue-{issue_number}", None)
+            self._flush()
+
+    def _flush(self) -> None:
+        """Write watcher state to disk. Must be called while holding self._lock."""
+        self._state_file.parent.mkdir(parents=True, exist_ok=True)
+        self._state_file.write_text(self._watcher.model_dump_json(indent=2))
 
     # ------------------------------------------------------------------
     # Per-run state

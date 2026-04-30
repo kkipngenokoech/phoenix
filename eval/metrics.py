@@ -128,6 +128,11 @@ def _read_run_log(issue_number: int) -> dict | None:
                     "issue_resolved": issue_resolved,
                     "reproducer_passed": reproducer_passed,
                     "resolved": issue_resolved,
+                    # LLM usage fields written by Run.flush_llm_usage()
+                    "llm_calls": data.get("llm_calls", 0),
+                    "input_tokens": data.get("input_tokens", 0),
+                    "output_tokens": data.get("output_tokens", 0),
+                    "inference_seconds": data.get("inference_seconds", 0.0),
                 }
     except Exception:
         pass

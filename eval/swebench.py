@@ -33,17 +33,22 @@ DATASET_IDS = {
     "full":     "princeton-nlp/SWE-bench",
 }
 
-# Python repos from SWE-bench Lite that Phoenix handles well
-# (pure Python, pip-installable, pytest-compatible)
+# All repos present in SWE-bench Lite (300 instances).
+# Covers the complete benchmark split — no exclusions.
 SUPPORTED_REPOS = {
     "astropy/astropy",
     "django/django",
     "matplotlib/matplotlib",
+    "mwaskom/seaborn",
+    "pallets/flask",
     "psf/requests",
+    "pylint-dev/pylint",
+    "pydata/xarray",
     "pytest-dev/pytest",
     "scikit-learn/scikit-learn",
-    "pallets/flask",
+    "sphinx-doc/sphinx",
     "sympy/sympy",
+    # Extended: additional repos present in Lite but not in original pilot
     "marshmallow-code/marshmallow",
     "pypa/pip",
 }
@@ -94,6 +99,11 @@ class SWEBenchResult:
     phoenix_final_label: str | None = None
     oracle_ran: bool = False
     oracle_skip_reason: str | None = None
+    # LLM usage (all agents combined for this issue)
+    llm_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    inference_seconds: float = 0.0
 
 
 @dataclass
@@ -192,39 +202,52 @@ def prepare_swebench_fork(
     from eval.baseline import ensure_labels
     ensure_labels(fork_full, github_token)
 
-    # Clone or update local copy
+    # Clone or update local copy (large repos like sphinx need more time)
     repo_dir = str(Path(workspace) / repo_name)
     if not Path(repo_dir).exists():
         logger.info(f"  Cloning {fork_full}...")
         code, out = _run(
-            ["git", "clone", f"https://x-access-token:{github_token}@github.com/{fork_full}.git", repo_dir],
-            timeout=120,
+            ["git", "clone", "--depth=50", f"https://x-access-token:{github_token}@github.com/{fork_full}.git", repo_dir],
+            timeout=300,
         )
+        if code != 0:
+            # Retry without --depth in case shallow clone fails
+            logger.warning(f"  Shallow clone failed, retrying full clone...")
+            code, out = _run(
+                ["git", "clone", f"https://x-access-token:{github_token}@github.com/{fork_full}.git", repo_dir],
+                timeout=600,
+            )
         if code != 0:
             raise RuntimeError(f"Clone failed: {out[:300]}")
     else:
-        _run(["git", "fetch", "origin"], cwd=repo_dir, timeout=60)
+        _run(["git", "fetch", "origin"], cwd=repo_dir, timeout=120)
 
     # Reset fork to base_commit
     logger.info(f"  Resetting {fork_full} to {instance.base_commit[:8]}...")
-    _run(["git", "checkout", "main"], cwd=repo_dir)
-    # Try main, then master
     code, _ = _run(["git", "checkout", "main"], cwd=repo_dir)
     if code != 0:
         _run(["git", "checkout", "master"], cwd=repo_dir)
 
-    # Fetch the base commit from the upstream (it may not be in the fork yet)
-    code, _ = _run(
-        ["git", "fetch", f"https://github.com/{instance.repo}.git", instance.base_commit],
-        cwd=repo_dir, timeout=60,
-    )
-    _run(["git", "reset", "--hard", instance.base_commit], cwd=repo_dir)
-    code, _ = _run(
-        ["git", "push", "origin", "HEAD", "--force"],
-        cwd=repo_dir, timeout=60,
+    # Fetch the base commit from upstream (may not be in shallow fork)
+    code, out = _run(
+        ["git", "fetch", "--unshallow", f"https://github.com/{instance.repo}.git", instance.base_commit],
+        cwd=repo_dir, timeout=300,
     )
     if code != 0:
-        logger.warning(f"  Force-push to {fork_full} failed — fork may be out of sync")
+        # Already full-depth or different branch; try plain fetch
+        _run(
+            ["git", "fetch", f"https://github.com/{instance.repo}.git", instance.base_commit],
+            cwd=repo_dir, timeout=120,
+        )
+    _run(["git", "reset", "--hard", instance.base_commit], cwd=repo_dir)
+    # Remove untracked files left by previous runs (prevents oracle contamination)
+    _run(["git", "clean", "-fd"], cwd=repo_dir)
+    code, out = _run(
+        ["git", "push", "origin", "HEAD", "--force"],
+        cwd=repo_dir, timeout=120,
+    )
+    if code != 0:
+        logger.warning(f"  Force-push to {fork_full} failed — fork may be out of sync: {out[:200]}")
 
     return fork_full
 
@@ -241,8 +264,24 @@ def mirror_swebench_issue(
     g = Github(github_token)
     fork_repo = g.get_repo(fork_full)
 
+    hints_section = (
+        f"\n\n## Hints\n{instance.hints_text.strip()}\n"
+        if instance.hints_text and instance.hints_text.strip()
+        else ""
+    )
+    if instance.fail_to_pass:
+        test_list = "\n".join(f"- `{t}`" for t in instance.fail_to_pass[:20])
+        tests_section = (
+            f"\n\n## Tests that must pass after this fix\n"
+            f"The following tests are currently failing and must pass once the issue is resolved:\n"
+            f"{test_list}\n"
+        )
+    else:
+        tests_section = ""
     body = (
-        f"{instance.problem_statement}\n\n"
+        f"{instance.problem_statement}"
+        f"{hints_section}"
+        f"{tests_section}\n\n"
         f"---\n"
         f"*SWE-bench instance: `{instance.instance_id}`  "
         f"Base commit: `{instance.base_commit[:8]}`*"
@@ -257,14 +296,88 @@ def mirror_swebench_issue(
 
 # ── Oracle evaluation ─────────────────────────────────────────────────────────
 
+def _extract_new_files_from_patch(patch_text: str, repo_dir: str) -> list[str]:
+    """Parse a unified diff and directly write files missing from the working tree.
+
+    Handles two cases that cause 'does not exist in index' failures:
+      1. Patch adds a genuinely new file (--- /dev/null).
+      2. Patch modifies a file that exists in the oracle's solution commit but not
+         at the SWE-bench base commit (e.g. test_wcs.py was added in the same PR
+         that fixed the bug — it doesn't exist at the pinned base commit).
+
+    For case 2 the file path appears in the +++ line but is absent on disk.
+    We reconstruct the file by taking all + lines across all hunks, which gives
+    us the oracle's complete intended test content.
+
+    Returns list of file paths that were successfully created/written.
+    """
+    import re
+    created: list[str] = []
+    root = Path(repo_dir)
+
+    file_sections = re.split(r"(?=^diff --git )", patch_text, flags=re.MULTILINE)
+    for section in file_sections:
+        if not section.strip():
+            continue
+
+        # Extract destination path from +++ b/<path>
+        dest_match = re.search(r"^\+\+\+ b/(.+)$", section, re.MULTILINE)
+        if not dest_match:
+            continue
+        dest_path = dest_match.group(1).strip()
+        if dest_path == "/dev/null":
+            continue  # deletion — nothing to create
+        target = root / dest_path
+
+        # Determine if we should handle this section:
+        #   (a) explicit new-file patch  OR
+        #   (b) file simply doesn't exist on disk at this base commit
+        is_new_file = ("--- /dev/null" in section or "new file mode" in section)
+        is_missing  = not target.exists()
+
+        if not (is_new_file or is_missing):
+            continue
+
+        # Reconstruct the file's after-state from all + lines in all hunks
+        lines: list[str] = []
+        in_hunk = False
+        for line in section.splitlines():
+            if line.startswith("@@"):
+                in_hunk = True
+                continue
+            if not in_hunk:
+                continue
+            if line.startswith("+"):
+                lines.append(line[1:])
+            elif line.startswith("\\"):
+                pass  # "No newline at end of file" marker
+            # - lines are context from the old file; for missing files we skip them
+
+        if not lines:
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("\n".join(lines))
+            created.append(dest_path)
+            logger.info("  Oracle patch: created new file %s (%d lines)", dest_path, len(lines))
+        except Exception as e:
+            logger.warning("  Oracle patch: failed to create %s: %s", dest_path, e)
+
+    return created
+
+
 def _apply_patch(patch_text: str, repo_dir: str) -> bool:
     """Apply a unified diff patch string to the repo. Returns True on success.
 
-    Tries a plain apply first, then ``git apply --3way`` so oracle ``test_patch`` can
-    merge when the agent already edited overlapping lines (common on pytest).
+    Strategy (in order):
+    1. git apply — standard fast path
+    2. git apply --3way — handles overlapping lines from Phoenix's changes
+    3. Direct file creation — handles new files absent at the base commit
+       (oracle test_patch adds test_table.py that doesn't exist in the index)
     """
     if not patch_text.strip():
         return True
+
     r1 = subprocess.run(
         ["git", "apply", "--whitespace=fix", "-"],
         input=patch_text,
@@ -276,6 +389,7 @@ def _apply_patch(patch_text: str, repo_dir: str) -> bool:
     if r1.returncode == 0:
         return True
     logger.warning("  Patch apply failed (will try 3-way): %s", (r1.stderr or "")[:300])
+
     r2 = subprocess.run(
         ["git", "apply", "--3way", "--whitespace=fix", "-"],
         input=patch_text,
@@ -288,52 +402,351 @@ def _apply_patch(patch_text: str, repo_dir: str) -> bool:
         logger.info("  Oracle test_patch applied via 3-way merge")
         return True
     logger.warning("  Patch apply failed after 3-way: %s", (r2.stderr or "")[:400])
+
+    # Fallback: directly create new files from the patch for hunks that fail
+    # because the file doesn't exist in the git index at this base commit.
+    created = _extract_new_files_from_patch(patch_text, repo_dir)
+    if created:
+        # Try git apply again for any remaining hunks (modified existing files)
+        r3 = subprocess.run(
+            ["git", "apply", "--whitespace=fix", "--ignore-missing-newline", "-"],
+            input=patch_text,
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if r3.returncode == 0 or created:
+            logger.info(
+                "  Oracle patch: direct-created %d new file(s); remaining hunks %s",
+                len(created),
+                "applied" if r3.returncode == 0 else "skipped (already handled)",
+            )
+            return True
+
     return False
+
+
+def _get_or_create_oracle_venv(workspace: str) -> tuple[str, str]:
+    """Return (python_bin, pip_bin) for a dedicated oracle venv.
+
+    This venv is isolated from the Phoenix execution environment, so processing
+    pytest-dev/pytest or any other repo never clobbers the oracle's pytest.
+    Created once per workspace; reused across instances.
+    """
+    import sys
+    venv_path = Path(workspace) / ".oracle-venv"
+    python_bin = str(venv_path / "bin" / "python")
+    pip_bin = str(venv_path / "bin" / "pip")
+
+    # Lightweight packages always needed by repo conftest.py files.
+    # Installed separately so they don't get blocked by numpy/scipy version
+    # conflicts when we later run pip install -e ".[dev,test]" for old repos.
+    _CONFTEST_DEPS = [
+        "pytest",
+        "hypothesis",        # astropy conftest.py: import hypothesis
+        "setuptools_scm",    # astropy _dev/scm_version.py via pytest warning config
+        "pytest-mock",
+        "pytest-xdist",
+        "pytest-timeout",
+        "legacy-cgi",        # cgi module removed in Python 3.13+; required by Django 3.x/4.x
+    ]
+
+    if not venv_path.exists():
+        logger.info("  Oracle: creating isolated venv at %s", venv_path)
+        # --system-site-packages: inherit compiled packages from the Phoenix venv
+        # (astropy, numpy, scipy, etc. that can't compile from old source on Python 3.14).
+        # Oracle installs its OWN pytest so it can never be clobbered by Phoenix's
+        # pip install -e . operations (local venv packages shadow system-site-packages).
+        subprocess.run(
+            [sys.executable, "-m", "venv", "--system-site-packages", str(venv_path)],
+            check=True, timeout=60,
+        )
+        subprocess.run(
+            [pip_bin, "install", "--quiet"] + _CONFTEST_DEPS,
+            check=True, timeout=240,
+        )
+        logger.info("  Oracle: venv ready (system-site-packages enabled)")
+    else:
+        # Verify pytest is healthy in the oracle venv (defensive check)
+        ver = subprocess.run([python_bin, "-m", "pytest", "--version"],
+                             capture_output=True, text=True, timeout=10)
+        if ver.returncode != 0 or "dev" in ver.stdout.lower():
+            logger.warning("  Oracle venv pytest broken (%s) — reinstalling", ver.stdout.strip())
+            subprocess.run([pip_bin, "install", "--quiet", "--upgrade"] + _CONFTEST_DEPS,
+                           capture_output=True, timeout=240)
+
+    return python_bin, pip_bin
+
+
+def _detect_test_id_format(test_ids: list[str]) -> str:
+    """Return the test ID format used by this instance.
+
+    Formats:
+      'django'       — 'method_name (dotted.module.ClassName)'  → runtests.py
+      'bare_name'    — 'test_function_name'                     → pytest -k
+      'pytest_nodeid'— 'path/to/test.py::Class::method'        → pytest ids
+    """
+    if not test_ids:
+        return "pytest_nodeid"
+    first = test_ids[0]
+    if "(" in first:
+        return "django"
+    if "::" in first or "/" in first:
+        return "pytest_nodeid"
+    return "bare_name"
+
+
+def _is_django_test_format(test_ids: list[str]) -> bool:
+    """Detect Django's native 'method_name (dotted.module.ClassName)' test ID format."""
+    return _detect_test_id_format(test_ids) == "django"
+
+
+def _convert_django_test_ids(test_ids: list[str]) -> list[str]:
+    """Convert 'method (module.Class)' → deduplicated 'module.Class' selectors for runtests.py.
+
+    Django's runtests.py only supports module-level or class-level selectors, not
+    method-level 4-part paths. We deduplicate so each class only runs once.
+    """
+    import re as _re
+    seen: set[str] = set()
+    out = []
+    for tid in test_ids:
+        m = _re.match(r"^\w+ \(([\w.]+)\)$", tid)
+        selector = m.group(1) if m else tid
+        if selector not in seen:
+            seen.add(selector)
+            out.append(selector)
+    return out
+
+
+def _run_django_tests(
+    test_ids: list[str],
+    repo_dir: str,
+    oracle_python: str,
+    timeout: int = 300,
+) -> tuple[set[str], set[str]]:
+    """Run Django-format test IDs via tests/runtests.py. Returns (passed, failed)."""
+    import re as _re
+    selectors = _convert_django_test_ids(test_ids)
+    tests_dir = str(Path(repo_dir) / "tests")
+    cmd = [oracle_python, "runtests.py", "--settings=test_sqlite",
+           "--verbosity=2", "--parallel=1"] + selectors
+    result = subprocess.run(
+        cmd, cwd=tests_dir, capture_output=True, text=True, timeout=timeout,
+    )
+    output = result.stdout + result.stderr
+
+    if result.returncode == 0:
+        return set(test_ids), set()
+
+    # Parse per-test verdict from verbosity=2 output.
+    # Python < 3.13 format: "test_method (module.Class) ... ok"
+    # Python 3.14+ format:  "test_method (module.Class.test_method) ... ok"
+    # Normalise both to "test_method (module.Class)" to match SWE-bench test IDs.
+    test_ids_set = set(test_ids)
+    failed: set[str] = set()
+    verdict_pat = _re.compile(r"^(.+?) \.\.\. (ok|FAIL|ERROR|skip.*|expected failure)$", _re.IGNORECASE)
+    for line in output.splitlines():
+        m = verdict_pat.match(line.strip())
+        if m:
+            label_part = m.group(1).strip()
+            verdict = m.group(2).lower()
+            # Resolve label_part → SWE-bench test ID
+            if label_part in test_ids_set:
+                key = label_part
+            else:
+                # Python 3.14: "test_method (module.Class.test_method)" → "test_method (module.Class)"
+                m2 = _re.match(r"^(\w+) \(([\w.]+)\.\w+\)$", label_part)
+                if m2:
+                    candidate = f"{m2.group(1)} ({m2.group(2)})"
+                    key = candidate if candidate in test_ids_set else None
+                else:
+                    key = None
+            if key and verdict in ("fail", "error"):
+                failed.add(key)
+
+    if failed:
+        return test_ids_set - failed, failed
+
+    # Exit non-0 but no parseable verdicts → treat all as failed
+    logger.warning("  Oracle Django tests: exit %d, no parsed verdicts\n%s",
+                   result.returncode, output[:4000])
+    return set(), set(test_ids)
+
+
+def _run_bare_name_tests(
+    test_ids: list[str],
+    repo_dir: str,
+    oracle_python: str,
+    timeout: int = 300,
+) -> tuple[set[str], set[str]]:
+    """Run bare function-name test IDs (sympy format) via pytest -k. Returns (passed, failed)."""
+    import re as _re
+    k_expr = " or ".join(test_ids[:50])
+    cmd = [oracle_python, "-m", "pytest", "--tb=line", "-k", k_expr]
+    result = subprocess.run(
+        cmd, cwd=repo_dir, capture_output=True, text=True, timeout=timeout,
+    )
+    output = result.stdout + result.stderr
+
+    if result.returncode == 0:
+        return set(test_ids), set()
+
+    if result.returncode == 1:
+        failed: set[str] = set()
+        for line in output.splitlines():
+            m = _re.match(r"^FAILED (.+?) -", line)
+            if m:
+                path_part = m.group(1).strip()  # e.g. "sympy/core/tests/test_expr.py::test_foo"
+                for tid in test_ids:
+                    if path_part.endswith(f"::{tid}"):
+                        failed.add(tid)
+        if failed:
+            return set(test_ids) - failed, failed
+        logger.warning("  Oracle bare-name tests: exit 1, no FAILED lines\n%s", output[:600])
+        return set(), set(test_ids)
+
+    logger.warning("  Oracle bare-name tests: exit %d\n%s", result.returncode, output[:800])
+    return set(), set()
 
 
 def _run_specific_tests(
     test_ids: list[str],
     repo_dir: str,
     timeout: int = 300,
+    oracle_python: str = "python",
+    oracle_pip: str = "pip",
 ) -> tuple[set[str], set[str]]:
-    """Run a specific list of pytest test IDs. Returns (passed, failed) sets."""
+    """Run a specific list of test IDs. Returns (passed, failed) sets.
+
+    Handles both pytest node IDs (most repos) and Django's native
+    'method (module.ClassName)' format automatically.
+
+    oracle_python / oracle_pip: binaries from the isolated oracle venv so that
+    Phoenix runs against other repos cannot clobber the oracle's pytest.
+    """
     if not test_ids:
         return set(), set()
 
-    cmd = ["python", "-m", "pytest", "--tb=no", "-q", "--no-header"] + test_ids[:50]
+    root = Path(repo_dir)
+
+    # Detect C-extension packages by presence of Cython source files.
+    # For these repos (astropy, matplotlib, scikit-learn, …) we MUST NOT run
+    # pip install -e . because:
+    #   1. Old base-commit C extensions often fail to compile on newer Pythons.
+    #   2. Even a failed editable install creates a .pth / direct_url.json
+    #      registration that OVERRIDES system-site-packages, then Python finds
+    #      the clone directory's astropy/__init__.py but can't load compiled
+    #      extensions → ImportError → exit 4.
+    # System-site-packages (Phoenix's venv, built via make install) already has
+    # working compiled versions of these packages.
+    has_cython = bool(list(root.rglob("*.pyx"))[:1])
+
+    if has_cython:
+        logger.info(
+            "  Oracle: C-extension repo detected (%s) — skipping editable install, "
+            "relying on system-site-packages for compiled extensions",
+            root.name,
+        )
+        # Safety: remove any leftover editable registration from a previous run
+        # that might shadow system-site-packages.
+        subprocess.run(
+            [oracle_pip, "uninstall", "-y", root.name],
+            capture_output=True, timeout=30,
+        )
+    else:
+        # Pure-Python repo: safe to install from source at the exact base commit.
+        # Try progressively simpler extras so we always get at least a plain install.
+        for spec in (".[dev,test]", ".[test]", ".[dev]", "."):
+            r = subprocess.run(
+                [oracle_pip, "install", "-e", spec, "--quiet", "--no-build-isolation"],
+                cwd=repo_dir, capture_output=True, timeout=240,
+            )
+            if r.returncode == 0:
+                break
+
+        # Requirements files for test-only deps not captured by package extras.
+        for req_file in ("requirements-dev.txt", "requirements-test.txt", "requirements-testing.txt"):
+            req_path = root / req_file
+            if req_path.exists():
+                subprocess.run(
+                    [oracle_pip, "install", "-r", str(req_path), "--quiet"],
+                    cwd=repo_dir, capture_output=True, timeout=240,
+                )
+                break
+
+    # Re-install lightweight conftest deps — old pip install -e ".[dev,test]"
+    # constraints can downgrade hypothesis / setuptools_scm that we installed.
+    subprocess.run(
+        [oracle_pip, "install", "--quiet", "--upgrade",
+         "hypothesis", "setuptools_scm", "pytest-mock", "pytest-xdist", "pytest-timeout"],
+        capture_output=True, timeout=120,
+    )
+
+    # Guard: pip install of pytest-dev/pytest replaces oracle venv's pytest
+    # with a dev build that fails minversion checks.
+    try:
+        ver = subprocess.run(
+            [oracle_python, "-m", "pytest", "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if "dev" in ver.stdout.lower() or ver.returncode != 0:
+            logger.warning(
+                "  Oracle venv: pip install clobbered pytest (%s) — restoring stable version",
+                ver.stdout.strip(),
+            )
+            subprocess.run(
+                [oracle_pip, "install", "--quiet", "--upgrade", "pytest"],
+                capture_output=True, timeout=120,
+            )
+    except Exception:
+        pass
+
+    # Dispatch based on test ID format — each repo family uses a different convention.
+    fmt = _detect_test_id_format(test_ids)
+    if fmt == "django":
+        return _run_django_tests(test_ids, repo_dir, oracle_python, timeout=timeout)
+    if fmt == "bare_name":
+        return _run_bare_name_tests(test_ids, repo_dir, oracle_python, timeout=timeout)
+
+    # --tb=short is supported by pytest 5+ and produces parseable FAILED lines.
+    cmd = [oracle_python, "-m", "pytest", "--tb=short"] + test_ids[:50]
     result = subprocess.run(
         cmd, cwd=repo_dir, capture_output=True, text=True, timeout=timeout,
     )
     output = result.stdout + result.stderr
 
-    passed: set[str] = set()
-    failed: set[str] = set()
-    for line in output.splitlines():
-        if line.startswith("PASSED"):
-            passed.add(line.split()[1] if len(line.split()) > 1 else line)
-        elif line.startswith("FAILED"):
-            tid = line.split("::")[0].replace("FAILED ", "").strip()
-            failed.add(tid)
-    # If pytest exit code 0, all ran tests passed
+    import re as _re
+
     if result.returncode == 0:
-        passed = set(test_ids)
-        failed = set()
-    elif result.returncode in (1,):
-        # Some tests failed — extract from output
-        import re
+        return set(test_ids), set()
+
+    if result.returncode == 1:
+        failed: set[str] = set()
         for line in output.splitlines():
-            m = re.match(r"^FAILED (.+?) -", line)
+            m = _re.match(r"^FAILED (.+?) -", line)
             if m:
                 failed.add(m.group(1).strip())
-        passed = set(test_ids) - failed
+        if failed:
+            return set(test_ids) - failed, failed
+        # Exit code 1 but no FAILED lines = collection/import error
+        logger.warning("  Oracle tests: exit 1, no FAILED lines (collection error?)\n%s", output[:600])
+        return set(), set(test_ids)
 
-    return passed, failed
+    # Exit codes 2–5: interrupted / internal error / usage error / no tests.
+    # "Did not run" → neither passed nor failed (don't penalise cp).
+    logger.warning("  Oracle tests: exit %d — tests did not run\n%s",
+                   result.returncode, output[:1200])
+    return set(), set()
 
 
 def evaluate_resolution(
     instance: SWEBenchInstance,
     pr_branch: str,
     repo_dir: str,
+    oracle_python: str = "python",
+    oracle_pip: str = "pip",
 ) -> OracleEvalOutcome:
     """Check if Phoenix's PR resolves the SWE-bench instance.
 
@@ -368,12 +781,18 @@ def evaluate_resolution(
             )
 
     # Evaluate FAIL_TO_PASS
-    ftp_passed, ftp_failed = _run_specific_tests(instance.fail_to_pass, repo_dir)
+    ftp_passed, ftp_failed = _run_specific_tests(
+        instance.fail_to_pass, repo_dir,
+        oracle_python=oracle_python, oracle_pip=oracle_pip,
+    )
     ftp_pass_count = len(ftp_passed)
     resolved = (ftp_pass_count == ftp_total) if ftp_total > 0 else None
 
     # Evaluate PASS_TO_PASS
-    ptp_passed, ptp_failed = _run_specific_tests(instance.pass_to_pass[:30], repo_dir)
+    ptp_passed, ptp_failed = _run_specific_tests(
+        instance.pass_to_pass[:30], repo_dir,
+        oracle_python=oracle_python, oracle_pip=oracle_pip,
+    )
     ptp_broken = len(ptp_failed)
     cp = ptp_broken == 0
 
@@ -421,6 +840,37 @@ def _clamp_swebench_wait_seconds(v: int) -> int:
     return max(120, min(int(v), 6 * 3600))
 
 
+def _load_completed_instance_ids(output_file: str) -> set[str]:
+    """Return instance_ids that already have a result in output_file (for resume)."""
+    p = Path(output_file)
+    if not p.exists():
+        return set()
+    try:
+        data = json.loads(p.read_text())
+        return {r["instance_id"] for r in data if isinstance(r, dict) and "instance_id" in r}
+    except Exception:
+        return set()
+
+
+def _trigger_phoenix_direct(fork: str, issue_number: int, trigger_url: str) -> None:
+    """POST to Phoenix /eval/trigger to dispatch a run without GitHub App webhooks."""
+    import urllib.request as _urllib_req
+    payload = json.dumps({"repo": fork, "issue_number": issue_number}).encode()
+    req = _urllib_req.Request(
+        trigger_url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with _urllib_req.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read())
+            run_id = result.get("run_id", "N/A")
+            logger.info(f"  Phoenix trigger: {result.get('status')} run={run_id[:8] if run_id != 'N/A' else 'N/A'}")
+    except Exception as e:
+        logger.warning(f"  Phoenix direct trigger failed: {e} — label-based fallback only")
+
+
 def run_swebench_eval(
     instances: list[SWEBenchInstance],
     github_token: str,
@@ -428,8 +878,19 @@ def run_swebench_eval(
     output_file: str = "eval/results/swebench_results.json",
     sse_url: str = "http://localhost:8000/eval/stream",
     max_wait: int | None = None,
+    workers: int = 1,
+    resume: bool = True,
 ) -> list[SWEBenchResult]:
-    """Run Phoenix on SWE-bench instances and evaluate with oracle tests."""
+    """Run Phoenix on SWE-bench instances and evaluate with oracle tests.
+
+    Args:
+        workers: Number of parallel Phoenix instances to run. Each worker
+                 needs its own clone workspace to avoid git conflicts.
+                 Set to 1 for sequential (safe default). 2-4 works well
+                 on a machine with enough RAM.
+        resume:  Skip instances whose instance_id is already in output_file.
+                 Enables safe restart after interruption.
+    """
     from eval.runner import EvalSSEListener, wait_for_completion, sw_eval_max_wait_seconds
     from eval.issues import CreatedIssue
 
@@ -441,6 +902,28 @@ def run_swebench_eval(
 
     Path(workspace).mkdir(parents=True, exist_ok=True)
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+
+    # Create (or verify) the isolated oracle venv once for the whole eval run.
+    # This venv is never touched by Phoenix's orchestrator, so pip install -e .
+    # inside a pytest-dev/pytest repo cannot clobber the oracle's pytest binary.
+    oracle_python, oracle_pip = _get_or_create_oracle_venv(workspace)
+
+    # Resume: skip already-completed instances
+    if resume:
+        completed = _load_completed_instance_ids(output_file)
+        if completed:
+            before = len(instances)
+            instances = [i for i in instances if i.instance_id not in completed]
+            logger.info(f"Resume: skipping {before - len(instances)} completed instance(s), {len(instances)} remaining")
+
+    if workers > 1:
+        logger.warning(
+            "workers=%d requested, but parallel execution is not yet implemented. "
+            "Running sequentially (workers=1). To parallelize, run multiple Phoenix server "
+            "instances on separate ports with separate --workspace dirs and split the instance "
+            "list with --only or --repos per process.",
+            workers,
+        )
 
     g = Github(github_token)
     your_username = g.get_user().login
@@ -480,7 +963,9 @@ def run_swebench_eval(
             gh_fork = g.get_repo(fork_full)
             gh_issue = gh_fork.get_issue(issue_number)
             gh_issue.add_to_labels("ai:ready")
-            logger.info(f"  Applied ai:ready → waiting for Phoenix...")
+            logger.info(f"  Applied ai:ready → triggering Phoenix directly...")
+            trigger_url = sse_url.replace("/eval/stream", "/eval/trigger")
+            _trigger_phoenix_direct(fork_full, issue_number, trigger_url)
 
             # 5. Wait for completion
             created = CreatedIssue(
@@ -507,7 +992,10 @@ def run_swebench_eval(
 
             if run.status == "succeeded" and run.pr_number:
                 pr_branch = f"phoenix/issue-{issue_number}"
-                outcome = evaluate_resolution(instance, pr_branch, repo_dir)
+                outcome = evaluate_resolution(
+                    instance, pr_branch, repo_dir,
+                    oracle_python=oracle_python, oracle_pip=oracle_pip,
+                )
                 oracle_resolved = outcome.resolved
                 cp_ok = outcome.cp
                 ftp_passed_n = outcome.fail_to_pass_passed
@@ -563,12 +1051,19 @@ def run_swebench_eval(
                 phoenix_final_label=run.final_label or None,
                 oracle_ran=oracle_ran,
                 oracle_skip_reason=oracle_skip_reason,
+                llm_calls=run_log.get("llm_calls", 0),
+                input_tokens=run_log.get("input_tokens", 0),
+                output_tokens=run_log.get("output_tokens", 0),
+                inference_seconds=run_log.get("inference_seconds", 0.0),
             )
             results.append(result)
             _print_result(result)
 
         except Exception as e:
-            logger.error(f"  Exception for {instance.instance_id}: {e}")
+            import traceback as _tb
+            err_detail = str(e)[:300]
+            logger.error(f"  Exception for {instance.instance_id}: {err_detail}")
+            logger.debug(_tb.format_exc())
             results.append(SWEBenchResult(
                 instance_id=instance.instance_id,
                 repo=instance.repo,
@@ -596,7 +1091,7 @@ def run_swebench_eval(
                 wait_timed_out=False,
                 phoenix_final_label=None,
                 oracle_ran=False,
-                oracle_skip_reason="harness_exception",
+                oracle_skip_reason=f"harness_exception: {err_detail}",
             ))
 
         # Save incrementally
@@ -633,9 +1128,11 @@ def _print_result(r: SWEBenchResult) -> None:
     ora = ""
     if not r.oracle_ran and r.oracle_skip_reason:
         ora = f"  ora_skip={r.oracle_skip_reason}"
+    tok_s = f"  tok={r.input_tokens}+{r.output_tokens}" if r.input_tokens or r.output_tokens else ""
+    inf_s = f"  inf={r.inference_seconds:.0f}s" if r.inference_seconds else ""
     print(
         f"  {icon} {r.instance_id:<42} oracle={ftp}  {repro_s}  {pol_s}  {repro_ok}  {fta_s}  "
-        f"[{r.elapsed_seconds:.0f}s/{r.wait_cap_seconds}s]{tmo}{ora}"
+        f"[{r.elapsed_seconds:.0f}s/{r.wait_cap_seconds}s]{tmo}{tok_s}{inf_s}{ora}"
     )
 
 
@@ -689,6 +1186,26 @@ def _print_summary(results: list[SWEBenchResult]) -> None:
     if er_runs:
         avg_er = sum(r.edit_ratio for r in er_runs) / len(er_runs)
         print(f"  Avg edit ratio             : {avg_er:.1%}  (n={len(er_runs)})")
+    print()
+    print(f"  ── LLM Usage ─────────────────────────────────────────")
+    tok_runs = [r for r in results if r.input_tokens or r.output_tokens]
+    if tok_runs:
+        total_in  = sum(r.input_tokens for r in tok_runs)
+        total_out = sum(r.output_tokens for r in tok_runs)
+        total_tok = total_in + total_out
+        avg_in    = total_in  / len(tok_runs)
+        avg_out   = total_out / len(tok_runs)
+        avg_calls = sum(r.llm_calls for r in tok_runs) / len(tok_runs)
+        avg_inf   = sum(r.inference_seconds for r in tok_runs) / len(tok_runs)
+        total_inf = sum(r.inference_seconds for r in tok_runs)
+        print(f"  Instances with usage data  : {len(tok_runs)}/{total}")
+        print(f"  Total tokens               : {total_tok:,}  (in={total_in:,}  out={total_out:,})")
+        print(f"  Avg tokens / issue         : {avg_in + avg_out:,.0f}  (in={avg_in:,.0f}  out={avg_out:,.0f})")
+        print(f"  Avg LLM calls / issue      : {avg_calls:.1f}")
+        print(f"  Avg inference time / issue : {avg_inf:.0f}s")
+        print(f"  Total inference time       : {total_inf/60:.1f} min")
+    else:
+        print(f"  No usage data recorded (run with instrumented build)")
     print("=" * 65)
 
     # Per-repo breakdown

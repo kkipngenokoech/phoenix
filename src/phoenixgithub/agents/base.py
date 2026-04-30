@@ -5,12 +5,17 @@ from __future__ import annotations
 import base64
 import logging
 import mimetypes
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
+
+from phoenixgithub.agents.usage import record_call
+from phoenixgithub.config import LLMProvider
+from phoenixgithub.models import RunContext
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +26,9 @@ class BaseAgent(ABC):
     role: str = ""
     system_prompt: str = ""
 
-    def __init__(self, llm: BaseChatModel) -> None:
+    def __init__(self, llm: BaseChatModel, provider: LLMProvider = LLMProvider.ANTHROPIC) -> None:
         self.llm = llm
+        self.provider = provider
 
     def invoke(
         self,
@@ -42,7 +48,9 @@ class BaseAgent(ABC):
             trace_tags=trace_tags,
             trace_metadata=trace_metadata,
         )
+        _t0 = time.perf_counter()
         response = self.llm.invoke(messages, config=config or None)
+        record_call(elapsed=time.perf_counter() - _t0, response=response)
         return self._stringify_content(response.content)
 
     def invoke_with_images(
@@ -56,8 +64,7 @@ class BaseAgent(ABC):
     ) -> str:
         """Send a prompt with image attachments for vision-capable models."""
         messages = [SystemMessage(content=self.system_prompt)]
-        model_name = type(self.llm).__name__.lower()
-        if "anthropic" in model_name:
+        if self.provider == LLMProvider.ANTHROPIC:
             content_blocks: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
             for image_path in image_paths:
                 path = Path(image_path)
@@ -72,7 +79,7 @@ class BaseAgent(ABC):
                     }
                 )
             messages.append(HumanMessage(content=content_blocks))
-        elif "openai" in model_name:
+        elif self.provider == LLMProvider.OPENAI:
             content_blocks = [{"type": "text", "text": user_prompt}]
             for image_path in image_paths:
                 path = Path(image_path)
@@ -104,7 +111,9 @@ class BaseAgent(ABC):
             trace_tags=trace_tags,
             trace_metadata=trace_metadata,
         )
+        _t0 = time.perf_counter()
         response = self.llm.invoke(messages, config=config or None)
+        record_call(elapsed=time.perf_counter() - _t0, response=response)
         return self._stringify_content(response.content)
 
     @staticmethod
@@ -141,40 +150,67 @@ class BaseAgent(ABC):
 
     @staticmethod
     def _sanitize_body_for_waf(body: str, max_chars: int = 1500) -> str:
-        """Remove code blocks / tracebacks and truncate to avoid WAF 403s.
+        """Extract signal-dense content from a GitHub issue body for safe LLM use.
 
-        Stack traces and JSON payloads in GitHub issue bodies frequently match
-        WAF rules for code injection, path traversal, and prompt injection.
+        Strategy (in order):
+        1. Strip full code blocks but keep their first 3 lines as context clues.
+        2. Extract error/exception lines from tracebacks (the most useful part).
+        3. Keep prose paragraphs up to the character limit.
+        4. Append the most useful extracted error lines at the end.
+
+        This preserves the semantic content of the issue while avoiding WAF triggers
+        from large code blocks, stack traces, and JSON payloads.
         """
         import re
 
+        TRACEBACK_ERROR_RE = re.compile(
+            r"^((?:[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)?"
+            r"[A-Z][a-zA-Z0-9_]*(?:Error|Exception)[:\s].*)$",
+            re.MULTILINE,
+        )
+        CODE_BLOCK_RE = re.compile(r"```([a-zA-Z0-9_.-]*)\n?(.*?)```", re.DOTALL)
+        TRACEBACK_FRAME_RE = re.compile(r'^\s*File ".*", line \d+')
+        CARET_LINE_RE = re.compile(r"^\s*[\^~]+\s*$")
+
+        # Extract error lines from code blocks before stripping them
+        error_lines: list[str] = []
+        for m in CODE_BLOCK_RE.finditer(body):
+            for err_m in TRACEBACK_ERROR_RE.finditer(m.group(2)):
+                line = err_m.group(0).strip()
+                if line and line not in error_lines:
+                    error_lines.append(line)
+
+        # Replace code blocks with stub + first 3 meaningful lines
         def _replace_block(m: re.Match) -> str:
             lang = (m.group(1) or "code").strip() or "code"
-            return f"[{lang} block omitted]"
+            preview_lines = [
+                ln for ln in m.group(2).splitlines()[:3]
+                if ln.strip() and not TRACEBACK_FRAME_RE.match(ln)
+            ]
+            stub = f"[{lang} block]"
+            return (stub + "\n" + "\n".join(preview_lines)) if preview_lines else stub
 
-        sanitized = re.sub(
-            r"```([a-zA-Z0-9_.-]*)\n?(.*?)```",
-            _replace_block,
-            body,
-            flags=re.DOTALL,
-        )
+        sanitized = CODE_BLOCK_RE.sub(_replace_block, body)
 
-        lines = sanitized.splitlines()
-        cleaned: list[str] = []
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith('File "') and ", line " in stripped:
-                continue
-            if stripped and all(c in "^~" for c in stripped):
-                continue
-            cleaned.append(line)
+        # Remove raw traceback frames and caret lines from prose
+        cleaned = [
+            line for line in sanitized.splitlines()
+            if not TRACEBACK_FRAME_RE.match(line) and not CARET_LINE_RE.match(line)
+        ]
         sanitized = "\n".join(cleaned)
 
-        if len(sanitized) > max_chars:
-            sanitized = sanitized[:max_chars] + "\n...(truncated)"
-        return sanitized
+        # Budget prose chars to leave room for key error lines
+        error_suffix = (
+            "\n\nKey errors from issue:\n" + "\n".join(error_lines[:3])
+            if error_lines else ""
+        )
+        prose_budget = max_chars - len(error_suffix)
+        if len(sanitized) > prose_budget:
+            sanitized = sanitized[:prose_budget] + "\n...(truncated)"
+
+        return sanitized + error_suffix
 
     @abstractmethod
-    def run(self, context: dict[str, Any]) -> dict[str, Any]:
+    def run(self, context: RunContext) -> dict[str, Any]:
         """Execute this agent's task. Returns outputs to merge into run context."""
         ...

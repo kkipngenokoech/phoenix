@@ -66,6 +66,8 @@ Rules:
   src/core/utils.py, src/core/models.py, or any path not visible in the tree.
   If you cannot identify the correct existing file, set "files_to_modify": [] and
   describe the uncertainty in "approach" — do not guess.
+- "files_to_modify" should contain SOURCE files that implement the broken behavior,
+  not test files. Fix the code that the tests exercise, not the tests themselves.
 - "files_to_create" is only for genuinely new files (e.g. a new test file alongside
   an existing one). Never create a substitute for a file that already exists.
 - Be specific about file paths (relative to repo root).
@@ -162,16 +164,44 @@ Rules:
         try:
             plan = json.loads(raw.strip().removeprefix("```json").removesuffix("```").strip())
         except json.JSONDecodeError:
-            logger.error(f"Planner returned invalid JSON:\n{raw[:500]}")
-            plan = {
-                "summary": issue_title,
-                "approach": raw[:1000],
-                "files_to_modify": [],
-                "files_to_create": [],
-                "steps": [],
-                "test_strategy": "manual",
-                "risk_level": "medium",
-            }
+            logger.warning("Planner returned invalid JSON — requesting one repair pass")
+            repair_prompt = (
+                f"Your previous response was not valid JSON. Here is what you produced:\n\n"
+                f"{raw[:2000]}\n\n"
+                "Respond ONLY with a valid JSON object matching this exact schema — "
+                "no markdown fences, no prose:\n"
+                "{\n"
+                '  "summary": "One-sentence summary",\n'
+                '  "approach": "High-level approach",\n'
+                '  "files_to_modify": ["path/to/file.py"],\n'
+                '  "files_to_create": [],\n'
+                '  "steps": [{"step_id": 1, "description": "...", "target_file": "...", "action": "modify"}],\n'
+                '  "test_strategy": "How to verify",\n'
+                '  "risk_level": "low"\n'
+                "}\n\n"
+                "Produce the corrected JSON now:"
+            )
+            repaired_raw = self.invoke(
+                repair_prompt,
+                trace_name="planner.repair_json",
+                trace_tags=["phoenixgithub", "planner", "repair_json", f"repo:{repo_tag}", issue_tag, run_tag],
+                trace_metadata=trace_meta,
+            )
+            logger.info(f"Planner repair response length: {len(repaired_raw)} chars")
+            try:
+                plan = json.loads(repaired_raw.strip().removeprefix("```json").removesuffix("```").strip())
+                logger.info("Planner JSON repair succeeded")
+            except json.JSONDecodeError:
+                logger.error(f"Planner returned invalid JSON after repair:\n{raw[:500]}")
+                plan = {
+                    "summary": issue_title,
+                    "approach": raw[:1000],
+                    "files_to_modify": [],
+                    "files_to_create": [],
+                    "steps": [],
+                    "test_strategy": "manual",
+                    "risk_level": "medium",
+                }
 
         return {"plan": plan, "visual_context": visual_context, "project_type": project_type}
 
@@ -304,8 +334,8 @@ Rules:
         root: str,
         issue_title: str,
         issue_body: str,
-        max_steps: int = 10,
-        max_chars_per_file: int = 1500,
+        max_steps: int = 12,
+        max_chars_per_file: int = 3000,
     ) -> str:
         """Navigate the repository with tool calls to find relevant files.
 
@@ -354,7 +384,7 @@ Rules:
             return f"{rel}/\n" + "\n".join(entries[:80])
 
         @lc_tool
-        def read_file(path: str, start_line: int = 1, end_line: int = 80) -> str:
+        def read_file(path: str, start_line: int = 1, end_line: int = 120) -> str:
             """Read a source file from the repository, with an optional line range."""
             target = _safe(path)
             if not target or not target.is_file():
@@ -430,14 +460,31 @@ Rules:
 
         from langchain_core.messages import SystemMessage as SM, HumanMessage as HM
 
-        issue_hint = self._sanitize_body_for_waf(issue_body, max_chars=600)
+        issue_hint = self._sanitize_body_for_waf(issue_body, max_chars=1500)
+
+        # BM25 pre-ranking: give the navigator a head start instead of navigating blind
+        bm25_ranked = self._bm25_rank_files(root, issue_title, issue_body)
+        if bm25_ranked:
+            bm25_hint = (
+                "**BM25 pre-ranking (start here — highest keyword relevance to the issue):**\n"
+                + "\n".join(f"  {i+1}. {p}  (score: {s:.2f})" for i, (p, s) in enumerate(bm25_ranked))
+                + "\nRead these files first before exploring elsewhere.\n\n"
+            )
+            logger.info("BM25 pre-ranking: %s", [p for p, _ in bm25_ranked])
+        else:
+            bm25_hint = ""
+
         messages: list = [
             SM(content=_NAVIGATION_SYSTEM_PROMPT),
             HM(content=(
                 f"Repository: {root_path.name}/\n\n"
+                f"{bm25_hint}"
                 f"Issue title: {issue_title}\n"
                 f"Issue description:\n{issue_hint}\n\n"
-                "Navigate the repository to find the 2–4 most relevant source files."
+                "Navigate the repository to find the 2–4 most relevant source files that "
+                "need to be changed to fix this issue. You may also read existing test files "
+                "to understand what correct behavior is expected. Search for the class/function "
+                "names mentioned in the issue."
             )),
         ]
 
@@ -481,6 +528,74 @@ Rules:
 
         logger.info("Planner agentic localize: returning %d file(s)", len(chunks))
         return "<!-- Found via agentic navigation -->\n\n" + "\n\n".join(chunks)
+
+    def _bm25_rank_files(
+        self,
+        root: str,
+        issue_title: str,
+        issue_body: str,
+        top_n: int = 8,
+    ) -> list[tuple[str, float]]:
+        """Score all code files by BM25 relevance to the issue. Returns (rel_path, score) sorted desc."""
+        import re as _re
+        try:
+            from rank_bm25 import BM25Okapi
+        except ImportError:
+            return []
+        try:
+            root_path = Path(root)
+            skip_dirs = {"node_modules", ".venv", "venv", ".git", "__pycache__", "dist", "build", ".next"}
+            code_exts = {".py", ".ts", ".js", ".tsx", ".jsx"}
+
+            files: list[Path] = []
+            for f in root_path.rglob("*"):
+                if f.suffix not in code_exts:
+                    continue
+                if any(sd in f.parts for sd in skip_dirs):
+                    continue
+                files.append(f)
+
+            if not files:
+                return []
+
+            def _tokenize(text: str) -> list[str]:
+                tokens = _re.findall(r"[a-zA-Z][a-zA-Z0-9_]{2,}", text.lower())
+                return [t for t in tokens if t not in _STOP_WORDS]
+
+            # Build corpus: path tokens + first 200 lines of content
+            corpus: list[list[str]] = []
+            for f in files:
+                try:
+                    lines = f.read_text(errors="replace").splitlines()[:200]
+                    path_tokens = _tokenize(str(f.relative_to(root_path)))
+                    content_tokens = _tokenize(" ".join(lines))
+                    corpus.append(path_tokens + content_tokens)
+                except Exception:
+                    corpus.append([])
+
+            # Build query: issue text + extracted identifiers (error classes, function names)
+            combined = issue_title + " " + issue_body
+            identifiers = _re.findall(r"\b[A-Z][a-zA-Z]+(?:Error|Exception|Warning)\b", combined)
+            func_names = _re.findall(r"def ([a-z_][a-z0-9_]+)", combined)
+            module_names = _re.findall(r"(?:import|from)\s+([a-zA-Z_][a-zA-Z0-9_.]+)", combined)
+            query_text = combined + " " + " ".join(identifiers + func_names + module_names)
+            query = _tokenize(query_text)
+
+            if not query:
+                return []
+
+            bm25 = BM25Okapi(corpus)
+            scores = bm25.get_scores(query)
+
+            ranked = sorted(
+                ((str(files[i].relative_to(root_path)), float(scores[i])) for i in range(len(files))),
+                key=lambda x: x[1],
+                reverse=True,
+            )
+            return [(p, s) for p, s in ranked[:top_n] if s > 0]
+        except Exception as e:
+            logger.warning("BM25 ranking failed: %s", e)
+            return []
 
     def _grep_for_keywords(self, root: str, keywords: list[str]) -> dict[str, int]:
         """Return {relative_path: keyword_hit_count} by grepping the repo.

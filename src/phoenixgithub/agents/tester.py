@@ -27,26 +27,31 @@ def compute_issue_resolved(
     *,
     test_passed: bool,
     reproducer_passed: bool | None,
+    target_tests_passed: bool | None = None,
 ) -> bool:
     """Whether Phoenix should treat the issue as resolved for the test step gate.
 
-    ``reproducer_passed``: True/False/None — None means no reproducer test was available.
+    ``reproducer_passed``:    True/False/None — None means no reproducer was available.
+    ``target_tests_passed``:  True/False/None — result of running FAIL_TO_PASS tests
+                              parsed from the issue body. None means not found/env error.
+                              False overrides a passing suite (structural oracle alignment).
     """
     m = (mode or "tests").strip().lower()
     if m not in _VALID_RESOLUTION_MODES:
         m = "tests"
     if m == "tests":
-        return bool(test_passed)
-    if m == "reproducer":
-        if reproducer_passed is None:
-            return False
-        return bool(reproducer_passed)
-    # both
-    if not test_passed:
+        result = bool(test_passed)
+    elif m == "reproducer":
+        result = bool(reproducer_passed) if reproducer_passed is not None else False
+    else:  # both
+        result = test_passed and reproducer_passed is not False
+
+    # Hard gate: if oracle-targeted tests from the issue body explicitly fail,
+    # the issue is not resolved regardless of mode — this bridges internal metric
+    # to the external oracle metric.
+    if result and target_tests_passed is False:
         return False
-    if reproducer_passed is False:
-        return False
-    return True
+    return result
 
 
 class TesterAgent(BaseAgent):
@@ -72,12 +77,14 @@ Respond ONLY with the JSON object, no markdown fences."""
     def __init__(
         self,
         llm,
+        provider=None,
         test_command: str = "pytest --import-mode=importlib --rootdir=.",
         allow_no_tests: bool = False,
         validation_profile: str = "auto",
         resolution_mode: str = "tests",
     ) -> None:
-        super().__init__(llm)
+        from phoenixgithub.config import LLMProvider
+        super().__init__(llm, provider or LLMProvider.ANTHROPIC)
         self.test_command = test_command
         self.allow_no_tests = allow_no_tests
         self.validation_profile = validation_profile.lower().strip()
@@ -118,13 +125,22 @@ Respond ONLY with the JSON object, no markdown fences."""
         if test_output["exit_code"] == 0 and ("passed" in stdout or skipped_unavailable):
             logger.info("Tests passed (or tool unavailable — skipped) — skipping LLM analysis")
             reproducer_passed = self._check_reproducer(context, clone_path)
+            target_tests_passed = self._run_target_tests(context.get("issue_body", ""), clone_path)
             issue_resolved = compute_issue_resolved(
-                self.resolution_mode, test_passed=True, reproducer_passed=reproducer_passed
+                self.resolution_mode, test_passed=True,
+                reproducer_passed=reproducer_passed,
+                target_tests_passed=target_tests_passed,
             )
+            feedback = ""
+            if not issue_resolved:
+                if target_tests_passed is False:
+                    feedback = self._target_tests_fail_feedback()
+                elif reproducer_passed is False:
+                    feedback = self._reproducer_fail_feedback(context)
             return {
                 "test_passed": True,
                 "test_output": test_output,
-                "feedback": "",
+                "feedback": feedback,
                 "reproducer_passed": reproducer_passed,
                 "issue_resolved": issue_resolved,
                 "resolved": issue_resolved,
@@ -141,13 +157,22 @@ Respond ONLY with the JSON object, no markdown fences."""
                         "Test failures pre-exist on baseline (no new failures from Phoenix) — treating as pass"
                     )
                     reproducer_passed = self._check_reproducer(context, clone_path)
+                    target_tests_passed = self._run_target_tests(context.get("issue_body", ""), clone_path)
                     issue_resolved = compute_issue_resolved(
-                        self.resolution_mode, test_passed=True, reproducer_passed=reproducer_passed
+                        self.resolution_mode, test_passed=True,
+                        reproducer_passed=reproducer_passed,
+                        target_tests_passed=target_tests_passed,
                     )
+                    feedback = ""
+                    if not issue_resolved:
+                        if target_tests_passed is False:
+                            feedback = self._target_tests_fail_feedback()
+                        elif reproducer_passed is False:
+                            feedback = self._reproducer_fail_feedback(context)
                     return {
                         "test_passed": True,
                         "test_output": test_output,
-                        "feedback": "",
+                        "feedback": feedback,
                         "test_verdict": {
                             "passed": True,
                             "summary": "Baseline test suite was already failing; Phoenix introduced no new failures.",
@@ -205,19 +230,108 @@ Respond ONLY with the JSON object, no markdown fences."""
         # Check reproducer test if one was written
         reproducer_passed = self._check_reproducer(context, clone_path)
         test_passed = bool(verdict.get("passed", False))
-        issue_resolved = compute_issue_resolved(
-            self.resolution_mode, test_passed=test_passed, reproducer_passed=reproducer_passed
+        # Only run oracle-targeted tests when the main suite passes — if the suite
+        # already fails, issue_resolved will be False regardless.
+        target_tests_passed = (
+            self._run_target_tests(context.get("issue_body", ""), clone_path)
+            if test_passed else None
         )
+        issue_resolved = compute_issue_resolved(
+            self.resolution_mode, test_passed=test_passed,
+            reproducer_passed=reproducer_passed,
+            target_tests_passed=target_tests_passed,
+        )
+
+        feedback = verdict.get("feedback", "")
+        if not issue_resolved and test_passed:
+            if target_tests_passed is False:
+                feedback = self._target_tests_fail_feedback()
+            elif reproducer_passed is False:
+                feedback = self._reproducer_fail_feedback(context)
 
         return {
             "test_passed": test_passed,
             "test_output": test_output,
             "test_verdict": verdict,
-            "feedback": verdict.get("feedback", ""),
+            "feedback": feedback,
             "reproducer_passed": reproducer_passed,
             "issue_resolved": issue_resolved,
             "resolved": issue_resolved,
         }
+
+    def _reproducer_fail_feedback(self, context: dict[str, Any]) -> str:
+        """Feedback for the coder when the main test suite passes but the reproducer still fails."""
+        reproducer_file = context.get("reproducer_file") or "the reproducer test"
+        reproducer_test = (context.get("reproducer_test") or "")[:1000]
+        hint = f"\n\nReproducer test code:\n```python\n{reproducer_test}\n```" if reproducer_test else ""
+        return (
+            f"The main test suite passes, but `{reproducer_file}` still fails after your fix. "
+            f"This means your fix is incomplete — the core issue is not resolved.\n\n"
+            f"Re-examine the root cause carefully:\n"
+            f"1. Trace through exactly what the reproducer test exercises.\n"
+            f"2. Identify which code path causes the wrong result or exception.\n"
+            f"3. Make sure your fix targets that exact code path, not a workaround.\n"
+            f"4. Run the reproducer mentally after applying your fix to confirm it passes."
+            f"{hint}"
+        )
+
+    def _target_tests_fail_feedback(self) -> str:
+        return (
+            "The main test suite passes, but the specific tests listed in the issue body "
+            "still fail after your fix. These are the exact tests the oracle uses to decide "
+            "whether the issue is resolved.\n\n"
+            "Re-examine your fix:\n"
+            "1. Run the failing tests directly to see the exact error output.\n"
+            "2. Trace the failure to the specific function or code path your fix must change.\n"
+            "3. Ensure your fix targets that path — not a workaround that bypasses it.\n"
+            "4. Confirm the tests pass after your change before finishing."
+        )
+
+    def _run_target_tests(self, issue_body: str, clone_path: str) -> bool | None:
+        """Run FAIL_TO_PASS test IDs parsed from the issue body.
+
+        The issue body includes a '## Tests that must pass after this fix' section
+        when the instance comes from SWE-bench. Running those tests specifically
+        bridges Phoenix's internal metric (full suite) to the oracle's metric
+        (those exact tests). Returns True/False/None (None = not found or env error).
+        """
+        import re as _re
+        body = issue_body or ""
+        section_start = body.find("## Tests that must pass after this fix")
+        if section_start < 0:
+            return None
+        section_end = body.find("\n## ", section_start + 1)
+        section = body[section_start: section_end if section_end > 0 else None]
+        test_ids = _re.findall(r"- `(.+?)`", section)
+        if not test_ids:
+            return None
+
+        logger.info("Running %d oracle-targeted test(s): %s", len(test_ids), test_ids[:5])
+        try:
+            result = subprocess.run(
+                ["python", "-m", "pytest"] + test_ids + ["--tb=short", "-q"],
+                cwd=clone_path,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode in (2, 3, 4, 5):
+                logger.warning(
+                    "Target tests: environment error (exit %d) — skipping gate\n%s",
+                    result.returncode, (result.stdout + result.stderr)[:400],
+                )
+                return None
+            passed = result.returncode == 0
+            logger.info(
+                "Target tests: %s (exit %d)\n%s",
+                "ALL PASS ✓" if passed else "SOME FAILED ✗",
+                result.returncode,
+                (result.stdout + result.stderr)[:800],
+            )
+            return passed
+        except Exception as e:
+            logger.warning("Target tests failed to run: %s", e)
+            return None
 
     def _check_reproducer(self, context: dict[str, Any], clone_path: str) -> bool | None:
         """Run the reproducer test if one was written. Returns True if it now passes.
@@ -239,12 +353,22 @@ Respond ONLY with the JSON object, no markdown fences."""
 
         try:
             result = subprocess.run(
-                ["python", "-m", "pytest", reproducer_file, "-x", "--tb=short", "-q", "--no-header"],
+                ["python", "-m", "pytest", reproducer_file, "-x", "--tb=short", "-q"],
                 cwd=clone_path,
                 capture_output=True,
                 text=True,
                 timeout=60,
             )
+            # Exit codes 2/3/4/5 are environment errors (usage error, internal error,
+            # minversion failure, no tests collected) — not a test result. Treat as None
+            # so the issue is not falsely blocked on an env problem.
+            if result.returncode in (2, 3, 4, 5):
+                logger.warning(
+                    "Reproducer check: environment error (exit %d) — treating as no-reproducer\n%s",
+                    result.returncode,
+                    (result.stdout + result.stderr)[:400],
+                )
+                return None
             passed = result.returncode == 0
             logger.info(
                 "Reproducer test %s: %s (exit %d)",
@@ -290,6 +414,24 @@ Respond ONLY with the JSON object, no markdown fences."""
                         )
                 except Exception as e:
                     logger.warning("pip install -e failed: %s", e)
+
+                # Guard: pip install -e . inside a pytest-dev/pytest repo replaces
+                # the venv's pytest with a dev build, breaking all subsequent runs.
+                # Check AFTER the install (not before) — that's when the clobber happens.
+                try:
+                    ver = subprocess.run(
+                        ["python", "-m", "pytest", "--version"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if "dev" in ver.stdout.lower() or ver.returncode != 0:
+                        logger.warning("pip install clobbered pytest (%s) — restoring stable version",
+                                       ver.stdout.strip())
+                        subprocess.run(
+                            ["pip", "install", "--quiet", "--upgrade", "pytest"],
+                            capture_output=True, timeout=120,
+                        )
+                except Exception:
+                    pass
             # Also install from requirements files
             for req_file in ("requirements-dev.txt", "requirements-test.txt", "requirements.txt"):
                 req_path = root / req_file
